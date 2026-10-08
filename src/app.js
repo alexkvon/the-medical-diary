@@ -491,6 +491,22 @@ function prepareOcrImage(source) {
     }
   }
 
+  // Мажоритарный фильтр 3x3: срезаем зернистость стекла LCD (муар от
+  // субпикселей экрана + шум матрицы); штрихи цифр остаются
+  const cleaned = new Uint8Array(n);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      let count = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const r = i + dy * w;
+        count += bin[r - 1] + bin[r] + bin[r + 1];
+      }
+      cleaned[i] = count >= 5 ? 1 : 0;
+    }
+  }
+  bin.set(cleaned);
+
   // Ч/б версию пишем в canvas — её получит Tesseract в резервном пути
   for (let i = 0, p = 0; i < n; i++, p += 4) {
     const v = bin[i] ? 0 : 255;
@@ -507,11 +523,12 @@ function prepareOcrImage(source) {
  *     Чистые функции без обращения к DOM.
  * ------------------------------------------------------------ */
 
-/* Эталонные маски: биты [a,b,c,d,e,f,g] — a-верх, b/c-право, d-низ, e/f-лево, g-центр */
+/* Эталонные маски: биты [a,b,c,d,e,f,g] — a-верх, b/c-право, d-низ, e/f-лево, g-центр.
+ * У «7» два варианта: классический и с хвостом по f (шрифт тонометра). */
 const DIGIT_PATTERNS = {
   0b1111110: '0', 0b0110000: '1', 0b1101101: '2', 0b1111001: '3',
   0b0110011: '4', 0b1011011: '5', 0b1011111: '6', 0b1110000: '7',
-  0b1111111: '8', 0b1111011: '9',
+  0b1110010: '7', 0b1111111: '8', 0b1111011: '9',
 };
 
 function findComponents(bin, w, h) {
@@ -562,16 +579,26 @@ function keepMask(bin, w, h) {
   return keep;
 }
 
-/* Строки цифр по горизонтальной проекции */
+/* Строки цифр по горизонтальной проекции.
+ * Порог активности строки — относительный: редкие цепочки шума (блики по стеклу)
+ * не должны склеивать полосы в одну, а ряд через тонкую «1» — разрывать её. */
 function findBands(keep, w, h) {
-  const bands = [];
+  const minRow = Math.max(4, Math.round(w * 0.018));
+  const raw = [];
   let start = -1;
   for (let y = 0; y <= h; y++) {
     let n = 0;
     if (y < h) for (let x = 0; x < w; x++) n += keep[y * w + x];
-    const on = n >= 2;
+    const on = n >= minRow;
     if (on && start === -1) start = y;
-    if (!on && start !== -1) { bands.push({ y0: start, y1: y - 1 }); start = -1; }
+    if (!on && start !== -1) { raw.push({ y0: start, y1: y - 1 }); start = -1; }
+  }
+  // склеиваем полосы, разделённые короткими (до 3 строк) провалами
+  const bands = [];
+  for (const r of raw) {
+    const last = bands[bands.length - 1];
+    if (last && r.y0 - last.y1 <= 4) last.y1 = r.y1;
+    else bands.push({ y0: r.y0, y1: r.y1 });
   }
   return bands.filter((b) => {
     const bh = b.y1 - b.y0 + 1;
@@ -609,14 +636,16 @@ function bestSlope(pixels, bh, w) {
   return { k: bestK, shift, uw };
 }
 
-/* Доли чёрного в зонах семи сегментов (для выпрямленной цифры) */
+/* Доли чёрного в зонах семи сегментов (для выпрямленной цифры).
+ * Вертикальные зоны ужаты по вертикали, чтобы перекладины a/d при наклоне
+ * не затекали в f/e/b/c (иначе «7» ловит фантомный сегмент f). */
 const SEG_ZONES = {
   a: [0.25, 0.75, 0.04, 0.26],
-  f: [0.02, 0.32, 0.18, 0.44],
-  b: [0.68, 0.98, 0.18, 0.44],
+  f: [0.02, 0.32, 0.24, 0.42],
+  b: [0.68, 0.98, 0.24, 0.42],
   g: [0.25, 0.75, 0.42, 0.60],
-  e: [0.02, 0.32, 0.58, 0.84],
-  c: [0.68, 0.98, 0.58, 0.84],
+  e: [0.02, 0.32, 0.60, 0.78],
+  c: [0.68, 0.98, 0.60, 0.78],
   d: [0.25, 0.75, 0.74, 0.98],
 };
 
@@ -646,14 +675,21 @@ function classifyGlyph(glyph, gw, gh) {
   const code = names.reduce((acc, nm) => (acc << 1) | (f[nm] >= 0.35 ? 1 : 0), 0);
   if (DIGIT_PATTERNS[code]) return DIGIT_PATTERNS[code];
 
-  // Расстояние Хэмминга <= 1 до ближайшего эталона
-  let best = null, bestD = 8;
+  // Хэмминг <= 1: правка одного сегмента допустима, только если он был
+  // на грани порога (сегмент с долей 0.74 явно включён — его «выключение»
+  // это не ошибка порога, а другая цифра)
+  const THR = 0.35;
+  let best = null, bestMargin = Infinity;
   for (const pattern in DIGIT_PATTERNS) {
-    let d = 0, v = code ^ Number(pattern);
-    while (v) { d += v & 1; v >>= 1; }
-    if (d < bestD) { bestD = d; best = DIGIT_PATTERNS[pattern]; }
+    const diff = code ^ Number(pattern);
+    if (diff === 0 || (diff & (diff - 1)) !== 0) continue; // дистанция не 1
+    const idx = 6 - Math.round(Math.log2(diff)); // бит a — старший, g — младший
+    const margin = Math.abs(f[names[idx]] - THR);
+    if (margin <= 0.12 && margin < bestMargin) { bestMargin = margin; best = DIGIT_PATTERNS[pattern]; }
   }
-  return bestD <= 1 ? best : '?';
+  if (best) return best;
+
+  return '?';
 }
 
 /*
