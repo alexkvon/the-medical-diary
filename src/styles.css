@@ -437,16 +437,15 @@ textarea.field {
   background: #0b1120;
 }
 
-/* Рамка-видоискатель */
+/* Рамка-видоискатель (портретная 3:4 — под вертикальный дисплей тонометра) */
 .viewfinder-frame {
   position: absolute;
   left: 50%;
   top: 42%;
   transform: translate(-50%, -50%);
-  width: min(84vw, 560px);
-  height: 63vw;
-  max-height: 420px;
-  aspect-ratio: 4 / 3;
+  width: min(70vw, 460px);
+  height: calc(min(70vw, 460px) * 1.3333);
+  max-height: 62vh;
   pointer-events: none;
 }
 

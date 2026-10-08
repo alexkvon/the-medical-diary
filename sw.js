@@ -11,7 +11,7 @@
 
 'use strict';
 
-const CACHE_NAME = 'medjournal-cache-v3';
+const CACHE_NAME = 'medjournal-cache-v4';
 
 /* Ядро приложения — кэшируем на этапе install строго */
 const APP_SHELL = [

@@ -284,8 +284,8 @@ async function openScanner() {
       audio: false,
       video: {
         facingMode: { ideal: 'environment' }, // задняя камера
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { ideal: 2560 },
+        height: { ideal: 1440 },
       },
     });
     video.srcObject = cameraStream;
@@ -340,10 +340,10 @@ function getViewfinderCrop(video) {
   const offX = (videoW * scale - screenW) / 2;
   const offY = (videoH * scale - screenH) / 2;
 
-  // Геометрия рамки из styles.css: ширина min(84vw, 560px), высота min(63vw, 420px),
-  // центр по горизонтали, по вертикали — на 42% высоты экрана
-  const vfW = Math.min(screenW * 0.84, 560);
-  const vfH = Math.min(screenW * 0.63, 420);
+  // Геометрия рамки из styles.css: портретная 3:4 — ширина min(70vw, 460px),
+  // высота 4/3 ширины (не выше 62vh), центр по горизонтали, по вертикали — на 42%
+  const vfW = Math.min(screenW * 0.7, 460);
+  const vfH = Math.min((vfW * 4) / 3, screenH * 0.62);
   const vfLeft = screenW / 2 - vfW / 2;
   const vfTop = screenH * 0.42 - vfH / 2;
 
@@ -362,14 +362,72 @@ function getViewfinderCrop(video) {
   };
 }
 
+/*
+ * Определяем прямоугольник дисплея по цвету: стекло LCD — крупная связная
+ * область малонасыщенных средне-тёмных пикселей, а корпус прибора (синий
+ * пластик, белые панели) отсекается по насыщенности и яркости.
+ * Возвращает {x0, y0, x1, y1} в координатах кадра или null.
+ */
+function detectDisplayBox(px, w, h) {
+  const s = 4; // анализ на уменьшенной сетке
+  const aw = Math.max(1, Math.floor(w / s));
+  const ah = Math.max(1, Math.floor(h / s));
+  const mask = new Uint8Array(aw * ah);
+  for (let y = 0; y < ah; y++) {
+    for (let x = 0; x < aw; x++) {
+      const p = ((y * s + (s >> 1)) * w + Math.min(w - 1, x * s + (s >> 1))) * 4;
+      const r = px[p], g = px[p + 1], b = px[p + 2];
+      const max = Math.max(r, g, b);
+      // Стекло LCD тёплое (оливковое: r > b), синий корпус — холодный (b > r),
+      // белые панели отсекаются по яркости
+      mask[y * aw + x] = r > b * 1.12 && max >= 35 && max <= 220 ? 1 : 0;
+    }
+  }
+
+  // Крупнейшая связная область (4-связность)
+  const seen = new Uint8Array(aw * ah);
+  let best = null;
+  const stack = [];
+  for (let i = 0; i < aw * ah; i++) {
+    if (!mask[i] || seen[i]) continue;
+    let area = 0, minX = aw, minY = ah, maxX = 0, maxY = 0;
+    stack.push(i);
+    seen[i] = 1;
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % aw, y = (p / aw) | 0;
+      area++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack.push(p - 1); }
+      if (x < aw - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack.push(p + 1); }
+      if (y > 0 && mask[p - aw] && !seen[p - aw]) { seen[p - aw] = 1; stack.push(p - aw); }
+      if (y < ah - 1 && mask[p + aw] && !seen[p + aw]) { seen[p + aw] = 1; stack.push(p + aw); }
+    }
+    if (!best || area > best.area) best = { area, minX, minY, maxX, maxY };
+  }
+
+  // Область должна быть достаточно крупной, чтобы считаться дисплеем
+  if (!best || best.area < aw * ah * 0.04) return null;
+  return {
+    x0: Math.max(0, best.minX * s - 2),
+    y0: Math.max(0, best.minY * s - 2),
+    x1: Math.min(w, (best.maxX + 1) * s + 2),
+    y1: Math.min(h, (best.maxY + 1) * s + 2),
+  };
+}
+
 /* ------------------------------------------------------------
  * 10. Подготовка кадра к распознаванию
- *     Масштаб -> адаптивная бинаризация (метод Брэдли) -> полярность
+ *     Область дисплея -> адаптивная бинаризация (Брэдли) -> полярность
  * ------------------------------------------------------------ */
 
 function prepareOcrImage(source) {
-  // Приводим высоту к разумной для распознавания
-  const k = Math.min(2.5, Math.max(0.35, 640 / source.height));
+  // Семисегментный путь работает в исходном разрешении кропа: апскейл
+  // размывает штрихи сегментов, поэтому крупный кадр только уменьшаем
+  const k = source.height > 1000 ? 1000 / source.height : 1;
   const w = Math.max(1, Math.round(source.width * k));
   const h = Math.max(1, Math.round(source.height * k));
 
@@ -377,6 +435,7 @@ function prepareOcrImage(source) {
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = k < 1;
   ctx.drawImage(source, 0, 0, w, h);
 
   const img = ctx.getImageData(0, 0, w, h);
@@ -418,6 +477,18 @@ function prepareOcrImage(source) {
   for (let i = 0; i < n; i++) black += bin[i];
   if (black > n / 2) {
     for (let i = 0; i < n; i++) bin[i] ^= 1;
+  }
+
+  // Отсекаем корпус прибора: оставляем бинаризацию только в области дисплея,
+  // иначе надписи корпуса («ВЕРХНЕЕ», «DIA.», «ПУЛЬС») ломают сегментацию строк
+  const box = detectDisplayBox(px, w, h);
+  if (box) {
+    for (let y = 0; y < h; y++) {
+      const rowOutside = y < box.y0 || y >= box.y1;
+      for (let x = 0; x < w; x++) {
+        if (rowOutside || x < box.x0 || x >= box.x1) bin[y * w + x] = 0;
+      }
+    }
   }
 
   // Ч/б версию пишем в canvas — её получит Tesseract в резервном пути
@@ -587,14 +658,29 @@ function classifyGlyph(glyph, gw, gh) {
 
 /*
  * Главная функция распознавателя: бинаризованное изображение ->
- * текст вида "102/86 75"-подобной структуры (строки через \n).
+ * текст вида "102\n86\n75" (строки через \n).
  * Строки по Y-проекции, наклон по перебору, цифры по X-проекции.
+ * Надписи корпуса («ВЕРХНЕЕ», «DIA.», «ПУЛЬС») отсекаются по высоте:
+ * настоящие цифры — самые высокие глифы в кадре.
  */
 function recognizeSevenSeg(bin, w, h) {
   const keep = keepMask(bin, w, h);
   const bands = findBands(keep, w, h);
-  const lines = [];
 
+  // Активная область по горизонтали (после отсечения корпуса это дисплей)
+  let actMinX = w, actMaxX = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (bin[i]) {
+      const x = i % w;
+      if (x < actMinX) actMinX = x;
+      if (x > actMaxX) actMaxX = x;
+    }
+  }
+  const edgeZone = Math.max(6, (actMaxX - actMinX) * 0.04);
+
+  // 1) Собираем боксы глифов по всем строкам, классификация — позже
+  const bandBoxes = [];
+  let maxGh = 0;
   for (const band of bands) {
     const bh = band.y1 - band.y0 + 1;
 
@@ -614,9 +700,8 @@ function recognizeSevenSeg(bin, w, h) {
       upright[pixels[i + 1] * uw + xs] = 1;
     }
 
-    // Цифры по X-проекции выпрямленной строки
-    let lineText = '';
-    let prevMaxX = -999, prevW = 0;
+    // Глифы по X-проекции выпрямленной строки
+    const boxes = [];
     let cs = -1;
     for (let x = 0; x <= uw; x++) {
       let n = 0;
@@ -646,13 +731,30 @@ function recognizeSevenSeg(bin, w, h) {
         const glyph = [];
         for (let y = ty; y <= by; y++) for (let gx = 0; gx < bw; gx++) glyph.push(grid[y][gx]);
 
-        const ch = classifyGlyph(glyph, bw, gh);
-        if (ch === '?') continue;
-        if (lineText && bx0 - prevMaxX > 0.6 * prevW) lineText += ' ';
-        lineText += ch;
-        prevMaxX = bx0 + bw;
-        prevW = bw;
+        boxes.push({ bx0, bw, glyph, gh });
+        if (gh > maxGh) maxGh = gh;
       }
+    }
+    bandBoxes.push({ shift, boxes });
+  }
+
+  // 2) Классификация: отсекаем надписи корпуса (они заметно ниже цифр)
+  const lines = [];
+  for (const { shift, boxes } of bandBoxes) {
+    let lineText = '';
+    let prevMaxX = -999, prevW = 0;
+    for (const b of boxes) {
+      if (b.gh < maxGh * 0.5) continue;
+      const ch = classifyGlyph(b.glyph, b.bw, b.gh);
+      if (ch === '?') continue;
+      // Рамка дисплея даёт узкие вертикальные обрывки у краёв — это не «единицы»
+      const origCenter = b.bx0 + b.bw / 2 - shift;
+      if (b.bw / b.gh < 0.4 &&
+          (origCenter - actMinX < edgeZone || actMaxX - origCenter < edgeZone)) continue;
+      if (lineText && b.bx0 - prevMaxX > 0.6 * prevW) lineText += ' ';
+      lineText += ch;
+      prevMaxX = b.bx0 + b.bw;
+      prevW = b.bw;
     }
     if (lineText) lines.push(lineText);
   }
@@ -756,6 +858,9 @@ function captureShot() {
   currentShot = canvas.toDataURL('image/jpeg', 0.92);
 
   const prepared = prepareOcrImage(canvas);
+  prepared.info = video.videoWidth
+    ? `Кадр ${video.videoWidth}×${video.videoHeight} → область ${canvas.width}×${canvas.height} → ч/б ${prepared.w}×${prepared.h}`
+    : '';
   stopCamera();
   setModal($('cameraModal'), false);
   openReview(currentShot, prepared);
@@ -763,6 +868,8 @@ function captureShot() {
 
 function openReview(shotDataUrl, prepared) {
   $('shotPreview').src = shotDataUrl;
+  $('ocrDebugImage').src = prepared.dataUrl;
+  $('ocrDebugInfo').textContent = prepared.info || '';
   $('reviewSys').value = '';
   $('reviewDia').value = '';
   $('reviewPul').value = '';

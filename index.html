@@ -145,7 +145,7 @@
         <span class="vf-corner br"></span>
       </div>
 
-      <p id="cameraHint" class="camera-hint">Наведите камеру на экран тонометра так, чтобы цифры попали в рамку</p>
+      <p id="cameraHint" class="camera-hint">Экран тонометра — целиком в рамку, цифры покрупнее</p>
 
       <div id="cameraError" class="camera-error" hidden>
         <i data-lucide="camera-off" class="h-8 w-8"></i>
@@ -184,6 +184,13 @@
         <details class="mt-4 rounded-2xl bg-slate-50 px-4 py-3">
           <summary class="cursor-pointer text-sm font-semibold text-slate-500">Распознанный текст</summary>
           <pre id="ocrRawText" class="mt-2 whitespace-pre-wrap break-all text-xs text-slate-400">—</pre>
+        </details>
+
+        <details class="mt-2 rounded-2xl bg-slate-50 px-4 py-3">
+          <summary class="cursor-pointer text-sm font-semibold text-slate-500">Диагностика распознавания</summary>
+          <img id="ocrDebugImage" class="mt-2 w-full rounded-xl border border-slate-200 bg-white" alt="Обработанное изображение для распознавания" />
+          <p id="ocrDebugInfo" class="mt-1.5 text-xs text-slate-400"></p>
+          <p class="mt-1 text-xs leading-relaxed text-slate-400">Здесь то, что видит распознаватель: цифры должны быть чёрными и чёткими, без рамки корпуса. Удерживайте палец на картинке, чтобы сохранить её.</p>
         </details>
 
         <div class="mt-4 grid grid-cols-3 gap-2.5">
