@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+  <title>МедЖурнал — дневник давления и пульса</title>
+  <meta name="description" content="PWA-дневник артериального давления и пульса: ручной ввод, сканирование экрана тонометра, история измерений и экспорт в CSV. Работает офлайн." />
+
+  <!-- ======================= PWA ======================= -->
+  <link rel="manifest" href="./manifest.json" />
+  <meta name="theme-color" content="#f43f5e" />
+
+  <!-- ======================= iOS ======================= -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="МедЖурнал" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+
+  <!-- Иконка во вкладке браузера -->
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="color-scheme" content="light" />
+
+  <!-- ============ Внешние библиотеки (кэшируются service worker'ом) ============ -->
+  <link rel="preconnect" href="https://cdn.tailwindcss.com" />
+  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['-apple-system', 'BlinkMacSystemFont', 'SF Pro Text', 'Segoe UI', 'Roboto', 'Helvetica Neue', 'Arial', 'sans-serif'],
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- ======================= Стили приложения ======================= -->
+  <link rel="stylesheet" href="./src/styles.css" />
+</head>
+<body>
+  <!-- ======================= Шапка ======================= -->
+  <header class="ios-blur sticky top-0 z-40">
+    <div class="mx-auto flex max-w-md items-center gap-3 px-4 pt-safe pb-3">
+      <div class="grid h-10 w-10 flex-none place-items-center rounded-2xl bg-rose-500 shadow-lg shadow-rose-500/30">
+        <i data-lucide="heart-pulse" class="h-6 w-6 text-white"></i>
+      </div>
+      <div class="min-w-0">
+        <h1 class="text-lg font-bold leading-tight">МедЖурнал</h1>
+        <p class="truncate text-xs text-slate-400">Давление и пульс</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-md px-4 pt-4 pb-safe">
+    <!-- Последнее измерение (заполняется из src/app.js) -->
+    <section id="summaryCard" class="card p-5" aria-live="polite"></section>
+
+    <!-- Сканирование тонометра -->
+    <button type="button" id="scanBtn" class="btn-scan mt-4">
+      <span class="btn-scan-icon"><i data-lucide="scan-line" class="h-6 w-6"></i></span>
+      <span class="min-w-0">
+        <span class="block text-base font-bold leading-tight">Сканировать тонометр</span>
+        <span class="mt-0.5 block text-xs font-medium text-rose-100">Снимок экрана прибора — цифры подставятся сами</span>
+      </span>
+    </button>
+
+    <!-- Ручной ввод -->
+    <section class="card mt-4 p-5">
+      <h2 class="flex items-center gap-2 text-base font-bold">
+        <i data-lucide="pencil-line" class="h-5 w-5 text-rose-500"></i>
+        Новое измерение
+      </h2>
+      <form id="manualForm" class="mt-4" novalidate>
+        <div class="grid grid-cols-3 gap-2.5">
+          <label class="field-wrap">
+            <span class="field-label">SYS</span>
+            <input id="manualSys" class="field field-accent" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="120" autocomplete="off" />
+            <span class="field-unit">верхнее</span>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label">DIA</span>
+            <input id="manualDia" class="field field-accent" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="80" autocomplete="off" />
+            <span class="field-unit">нижнее</span>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label">Пульс</span>
+            <input id="manualPul" class="field" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="70" autocomplete="off" />
+            <span class="field-unit">уд/мин</span>
+          </label>
+        </div>
+        <label class="mt-3 block">
+          <span class="field-label">Комментарий</span>
+          <textarea id="manualComment" class="field" rows="2" maxlength="300" placeholder="Например: после прогулки"></textarea>
+        </label>
+        <button type="submit" class="btn-primary mt-4 w-full">
+          <i data-lucide="plus" class="h-5 w-5"></i>
+          Сохранить измерение
+        </button>
+      </form>
+    </section>
+
+    <!-- История -->
+    <section class="mt-6">
+      <div class="flex items-baseline justify-between px-1">
+        <h2 class="flex items-center gap-2 text-base font-bold">
+          <i data-lucide="history" class="h-5 w-5 text-rose-500"></i>
+          История
+        </h2>
+        <span class="text-sm text-slate-400"><span id="recordsCount">0</span> зап.</span>
+      </div>
+
+      <ul id="historyList" class="mt-3 space-y-2.5"></ul>
+      <div id="historyEmpty" class="empty-note mt-3" hidden>Пока нет записей — добавьте первое измерение вручную или отсканируйте тонометр.</div>
+
+      <button type="button" id="exportBtn" class="btn-secondary mt-4 w-full">
+        <i data-lucide="download" class="h-5 w-5"></i>
+        Экспорт в CSV
+      </button>
+    </section>
+
+    <p class="px-2 pb-2 pt-5 text-center text-xs leading-relaxed text-slate-300">
+      Данные хранятся только в памяти этого устройства.<br />
+      Приложение не заменяет консультацию врача.
+    </p>
+  </main>
+
+  <!-- ======================= Модальное окно камеры ======================= -->
+  <div id="cameraModal" class="modal modal-camera" role="dialog" aria-modal="true" aria-label="Сканирование тонометра">
+    <div class="modal-backdrop"></div>
+
+    <div class="camera-stage">
+      <video id="scannerVideo" class="camera-video" autoplay playsinline muted></video>
+
+      <!-- Рамка-видоискатель -->
+      <div class="viewfinder-frame" aria-hidden="true">
+        <span class="vf-corner tl"></span>
+        <span class="vf-corner tr"></span>
+        <span class="vf-corner bl"></span>
+        <span class="vf-corner br"></span>
+      </div>
+
+      <p id="cameraHint" class="camera-hint">Наведите камеру на экран тонометра так, чтобы цифры попали в рамку</p>
+
+      <div id="cameraError" class="camera-error" hidden>
+        <i data-lucide="camera-off" class="h-8 w-8"></i>
+        <p id="cameraErrorText"></p>
+      </div>
+    </div>
+
+    <div class="camera-controls">
+      <button type="button" id="cancelScanBtn" class="btn-camera-secondary">Отмена</button>
+      <div class="camera-capture">
+        <button type="button" id="shotBtn" class="shutter" aria-label="Сделать снимок" title="Сделать снимок"></button>
+        <span class="shutter-caption">Сделать снимок</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================= Проверка распознанного ======================= -->
+  <div id="reviewModal" class="modal" role="dialog" aria-modal="true" aria-label="Проверка распознанных показаний">
+    <div class="modal-backdrop"></div>
+
+    <div class="modal-sheet">
+      <div class="mx-auto mb-4 h-1.5 w-10 rounded-full bg-slate-200" aria-hidden="true"></div>
+      <h2 class="text-lg font-bold">Проверьте показания</h2>
+      <p class="mt-0.5 text-sm text-slate-400">Сравните цифры со снимком и исправьте при необходимости.</p>
+
+      <img id="shotPreview" class="mt-4 max-h-56 w-full rounded-2xl border border-slate-100 object-contain" alt="Снимок экрана тонометра" />
+
+      <!-- Прогресс распознавания -->
+      <div id="ocrProgress" class="mt-4" hidden>
+        <div class="progress-track"><div id="ocrProgressBar" class="progress-bar"></div></div>
+        <p id="ocrProgressText" class="mt-1.5 text-center text-xs text-slate-400">Готовлю распознавание…</p>
+      </div>
+
+      <!-- Поля проверки (появляются после OCR) -->
+      <div id="reviewFields" hidden>
+        <details class="mt-4 rounded-2xl bg-slate-50 px-4 py-3">
+          <summary class="cursor-pointer text-sm font-semibold text-slate-500">Распознанный текст</summary>
+          <pre id="ocrRawText" class="mt-2 whitespace-pre-wrap break-all text-xs text-slate-400">—</pre>
+        </details>
+
+        <div class="mt-4 grid grid-cols-3 gap-2.5">
+          <label class="field-wrap">
+            <span class="field-label">SYS</span>
+            <input id="reviewSys" class="field field-accent" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="120" autocomplete="off" />
+            <span class="field-unit">верхнее</span>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label">DIA</span>
+            <input id="reviewDia" class="field field-accent" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="80" autocomplete="off" />
+            <span class="field-unit">нижнее</span>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label">Пульс</span>
+            <input id="reviewPul" class="field" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="70" autocomplete="off" />
+            <span class="field-unit">уд/мин</span>
+          </label>
+        </div>
+
+        <label class="mt-3 block">
+          <span class="field-label">Комментарий</span>
+          <textarea id="reviewComment" class="field" rows="2" maxlength="300" placeholder="Самочувствие, лекарства, обстоятельства…"></textarea>
+        </label>
+
+        <div class="mt-5 grid grid-cols-2 gap-2.5">
+          <button type="button" id="retakeBtn" class="btn-secondary">
+            <i data-lucide="refresh-cw" class="h-5 w-5"></i>
+            Переснять
+          </button>
+          <button type="button" id="saveScanBtn" class="btn-primary">
+            <i data-lucide="check" class="h-5 w-5"></i>
+            Сохранить
+          </button>
+        </div>
+        <button type="button" id="reviewCancelBtn" class="btn-ghost mt-2 w-full">Закрыть без сохранения</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Скрытый canvas для стоп-кадра -->
+  <canvas id="captureCanvas" class="hidden" aria-hidden="true"></canvas>
+
+  <!-- Тост-уведомления -->
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <!-- ======================= Скрипты ======================= -->
+  <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+  <script src="./src/app.js"></script>
+</body>
+</html>
