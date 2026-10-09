@@ -61,12 +61,12 @@
     <!-- Последнее измерение (заполняется из src/app.js) -->
     <section id="summaryCard" class="card p-5" aria-live="polite"></section>
 
-    <!-- Сканирование тонометра -->
-    <button type="button" id="scanBtn" class="btn-scan mt-4">
-      <span class="btn-scan-icon"><i data-lucide="scan-line" class="h-6 w-6"></i></span>
+    <!-- Голосовой ввод -->
+    <button type="button" id="voiceBtn" class="btn-cta mt-4">
+      <span class="btn-cta-icon"><i data-lucide="mic" class="h-6 w-6"></i></span>
       <span class="min-w-0">
-        <span class="block text-base font-bold leading-tight">Сканировать тонометр</span>
-        <span class="mt-0.5 block text-xs font-medium text-rose-100">Снимок экрана прибора — цифры подставятся сами</span>
+        <span class="block text-base font-bold leading-tight">Записать голосом</span>
+        <span class="mt-0.5 block text-xs font-medium text-rose-100">Произнесите показания — поля заполнятся сами</span>
       </span>
     </button>
 
@@ -130,35 +130,28 @@
     </p>
   </main>
 
-  <!-- ======================= Модальное окно камеры ======================= -->
-  <div id="cameraModal" class="modal modal-camera" role="dialog" aria-modal="true" aria-label="Сканирование тонометра">
+  <!-- ======================= Голосовой ввод ======================= -->
+  <div id="voiceModal" class="modal" role="dialog" aria-modal="true" aria-label="Голосовой ввод показаний">
     <div class="modal-backdrop"></div>
 
-    <div class="camera-stage">
-      <video id="scannerVideo" class="camera-video" autoplay playsinline muted></video>
-
-      <!-- Рамка-видоискатель -->
-      <div class="viewfinder-frame" aria-hidden="true">
-        <span class="vf-corner tl"></span>
-        <span class="vf-corner tr"></span>
-        <span class="vf-corner bl"></span>
-        <span class="vf-corner br"></span>
+    <div class="voice-stage">
+      <div id="micWrap" class="mic-wrap">
+        <span class="mic-ring" aria-hidden="true"></span>
+        <span class="mic-ring mic-ring-2" aria-hidden="true"></span>
+        <i data-lucide="mic" class="mic-icon"></i>
       </div>
 
-      <p id="cameraHint" class="camera-hint">Экран тонометра — целиком в рамку, цифры покрупнее</p>
+      <p id="voiceStatus" class="voice-status">Слушаю… Произнесите показания (например: 120 на 80, пульс 70)</p>
 
-      <div id="cameraError" class="camera-error" hidden>
-        <i data-lucide="camera-off" class="h-8 w-8"></i>
-        <p id="cameraErrorText"></p>
+      <div id="voiceError" class="voice-error" hidden>
+        <i data-lucide="mic-off" class="h-9 w-9"></i>
+        <p id="voiceErrorText"></p>
       </div>
     </div>
 
-    <div class="camera-controls">
-      <button type="button" id="cancelScanBtn" class="btn-camera-secondary">Отмена</button>
-      <div class="camera-capture">
-        <button type="button" id="shotBtn" class="shutter" aria-label="Сделать снимок" title="Сделать снимок"></button>
-        <span class="shutter-caption">Сделать снимок</span>
-      </div>
+    <div class="voice-controls">
+      <button type="button" id="voiceRetryBtn" class="btn-pill" hidden>Слушать ещё раз</button>
+      <button type="button" id="voiceCloseBtn" class="btn-pill">Закрыть</button>
     </div>
   </div>
 
@@ -169,28 +162,13 @@
     <div class="modal-sheet">
       <div class="mx-auto mb-4 h-1.5 w-10 rounded-full bg-slate-200" aria-hidden="true"></div>
       <h2 class="text-lg font-bold">Проверьте показания</h2>
-      <p class="mt-0.5 text-sm text-slate-400">Сравните цифры со снимком и исправьте при необходимости.</p>
+      <p class="mt-0.5 text-sm text-slate-400">Сверьтесь с тонометром и исправьте при необходимости.</p>
 
-      <img id="shotPreview" class="mt-4 max-h-56 w-full rounded-2xl border border-slate-100 object-contain" alt="Снимок экрана тонометра" />
-
-      <!-- Прогресс распознавания -->
-      <div id="ocrProgress" class="mt-4" hidden>
-        <div class="progress-track"><div id="ocrProgressBar" class="progress-bar"></div></div>
-        <p id="ocrProgressText" class="mt-1.5 text-center text-xs text-slate-400">Готовлю распознавание…</p>
-      </div>
-
-      <!-- Поля проверки (появляются после OCR) -->
-      <div id="reviewFields" hidden>
+      <!-- Поля проверки -->
+      <div id="reviewFields">
         <details class="mt-4 rounded-2xl bg-slate-50 px-4 py-3">
-          <summary class="cursor-pointer text-sm font-semibold text-slate-500">Распознанный текст</summary>
-          <pre id="ocrRawText" class="mt-2 whitespace-pre-wrap break-all text-xs text-slate-400">—</pre>
-        </details>
-
-        <details class="mt-2 rounded-2xl bg-slate-50 px-4 py-3">
-          <summary class="cursor-pointer text-sm font-semibold text-slate-500">Диагностика распознавания</summary>
-          <img id="ocrDebugImage" class="mt-2 w-full rounded-xl border border-slate-200 bg-white" alt="Обработанное изображение для распознавания" />
-          <p id="ocrDebugInfo" class="mt-1.5 text-xs text-slate-400"></p>
-          <p class="mt-1 text-xs leading-relaxed text-slate-400">Здесь то, что видит распознаватель: цифры должны быть чёрными и чёткими, без рамки корпуса. Удерживайте палец на картинке, чтобы сохранить её.</p>
+          <summary class="cursor-pointer text-sm font-semibold text-slate-500">Что распознано</summary>
+          <p id="heardText" class="mt-2 break-words text-sm text-slate-400">—</p>
         </details>
 
         <div class="mt-4 grid grid-cols-3 gap-2.5">
@@ -217,11 +195,11 @@
         </label>
 
         <div class="mt-5 grid grid-cols-2 gap-2.5">
-          <button type="button" id="retakeBtn" class="btn-secondary">
-            <i data-lucide="refresh-cw" class="h-5 w-5"></i>
-            Переснять
+          <button type="button" id="editBtn" class="btn-secondary">
+            <i data-lucide="pencil-line" class="h-5 w-5"></i>
+            Изменить
           </button>
-          <button type="button" id="saveScanBtn" class="btn-primary">
+          <button type="button" id="saveReviewBtn" class="btn-primary">
             <i data-lucide="check" class="h-5 w-5"></i>
             Сохранить
           </button>
@@ -231,16 +209,11 @@
     </div>
   </div>
 
-  <!-- Скрытые canvas: стоп-кадр и подготовленное к распознаванию ч/б изображение -->
-  <canvas id="captureCanvas" class="hidden" aria-hidden="true"></canvas>
-  <canvas id="ocrCanvas" class="hidden" aria-hidden="true"></canvas>
-
   <!-- Тост-уведомления -->
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <!-- ======================= Скрипты ======================= -->
   <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
   <script src="./src/app.js"></script>
 </body>
 </html>

@@ -11,7 +11,7 @@
 
 'use strict';
 
-const CACHE_NAME = 'medjournal-cache-v5';
+const CACHE_NAME = 'medjournal-cache-v6';
 
 /* Ядро приложения — кэшируем на этапе install строго */
 const APP_SHELL = [
@@ -30,7 +30,6 @@ const APP_SHELL = [
 const CDN_ASSETS = [
   'https://cdn.tailwindcss.com/3.4.16',
   'https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js',
-  'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
 ];
 
 /* ---------------- install: прогрев кэша ---------------- */
@@ -103,8 +102,7 @@ async function staleWhileRevalidate(request) {
   return cached || (await network) || Response.error();
 }
 
-/* Кэш → при промахе сеть и сохранение (Tailwind, Lucide, Tesseract.js,
- * а также подгружаемые им на ходу wasm-ядро и языковые данные tessdata) */
+/* Кэш → при промахе сеть и сохранение (CDN-библиотеки: Tailwind, Lucide) */
 async function cacheFirst(request) {
   const cache = await caches.open(CACHE_NAME);
   const cached = await cache.match(request);

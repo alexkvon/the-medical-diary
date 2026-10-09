@@ -2,11 +2,9 @@
  * МедЖурнал — вся интерактивная логика приложения.
  *
  *  - Хранилище: localStorage (id, date, sys, dia, pul, comment)
- *  - Камера: navigator.mediaDevices.getUserMedia — запуск строго
- *    по клику на кнопку сканирования
- *  - OCR: стоп-кадр рамки-видоискателя -> бинаризация ->
- *    семисегментный распознаватель (основной, офлайн) ->
- *    Tesseract (резерв)
+ *  - Голосовой ввод: Web Speech API (webkitSpeechRecognition /
+ *    SpeechRecognition), ru-RU — показания диктуются, парсер
+ *    извлекает числа и заполняет поля проверки
  *  - Экспорт: medical_diary.csv
  *  - Offline: регистрация ./sw.js
  * ============================================================ */
@@ -44,10 +42,12 @@ const CSV_BOM = String.fromCharCode(0xfeff);
 
 const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-let cameraStream = null; // активный MediaStream камеры
-let currentShot = null;  // dataURL последнего стоп-кадра
 let toastTimer = null;
-let ocrWorker = null;    // лениво создаваемый воркер Tesseract
+let recognition = null;   // текущий инстанс SpeechRecognition
+let voiceActive = false;  // слушаем прямо сейчас
+let voiceGotResult = false; // пришли ли хоть какие-то данные
+
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 /* ------------------------------------------------------------
  * 3. Утилиты
@@ -173,7 +173,7 @@ function renderSummary() {
   if (!last) {
     box.innerHTML = `
       <p class="text-xs font-semibold uppercase tracking-wider text-slate-400">Последнее измерение</p>
-      <div class="empty-note mt-3">Здесь появится ваше последнее измерение.<br />Добавьте его вручную или отсканируйте тонометр.</div>`;
+      <div class="empty-note mt-3">Здесь появится ваше последнее измерение.<br />Добавьте его вручную или надиктуйте голосом.</div>`;
     return;
   }
 
@@ -263,749 +263,221 @@ function onManualSubmit(event) {
 }
 
 /* ------------------------------------------------------------
- * 9. Камера (запуск строго по кнопке сканирования)
+ * 9. Голосовой ввод (Web Speech API)
  * ------------------------------------------------------------ */
 
-async function openScanner() {
-  const video = $('scannerVideo');
-  $('cameraError').hidden = true;
-  $('cameraHint').hidden = false;
-  $('shotBtn').disabled = false;
-  setModal($('cameraModal'), true);
-
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showCameraError('Камера недоступна. Откройте приложение по HTTPS (например, на GitHub Pages) либо введите данные вручную.');
-    return;
-  }
-
-  try {
-    stopCamera();
-    cameraStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: 'environment' }, // задняя камера
-        width: { ideal: 2560 },
-        height: { ideal: 1440 },
-      },
-    });
-    video.srcObject = cameraStream;
-    try {
-      await video.play(); // на iOS требует playsinline
-    } catch {
-      /* автозапуск может быть отклонён — не критично */
-    }
-  } catch (err) {
-    console.warn('[МедЖурнал] Камера:', err);
-    showCameraError(
-      err && err.name === 'NotAllowedError'
-        ? 'Доступ к камере запрещён. Разрешите его в настройках браузера и повторите.'
-        : 'Не удалось запустить камеру. Введите данные вручную.'
-    );
-  }
-}
-
-function stopCamera() {
-  if (cameraStream) {
-    cameraStream.getTracks().forEach((track) => track.stop());
-    cameraStream = null;
-  }
-  $('scannerVideo').srcObject = null;
-}
-
-function showCameraError(message) {
-  $('cameraHint').hidden = true;
-  $('cameraErrorText').textContent = message;
-  $('cameraError').hidden = false;
-  $('shotBtn').disabled = true;
-}
-
-function closeScanner() {
-  stopCamera();
-  setModal($('cameraModal'), false);
-}
-
-/*
- * Область кадра, ограниченная рамкой-видоискателем, в координатах видео.
- * Видео растянуто на весь экран с обрезкой краёв (object-fit: cover),
- * поэтому экранные координаты рамки пересчитываются в пиксели потока.
- */
-function getViewfinderCrop(video) {
-  const screenW = video.clientWidth || window.innerWidth;
-  const screenH = video.clientHeight || window.innerHeight;
-  const videoW = video.videoWidth;
-  const videoH = video.videoHeight;
-  if (!videoW || !videoH) return null;
-
-  const scale = Math.max(screenW / videoW, screenH / videoH); // object-fit: cover
-  const offX = (videoW * scale - screenW) / 2;
-  const offY = (videoH * scale - screenH) / 2;
-
-  // Геометрия рамки из styles.css: портретная 3:4 — ширина min(70vw, 460px),
-  // высота 4/3 ширины (не выше 62vh), центр по горизонтали, по вертикали — на 42%
-  const vfW = Math.min(screenW * 0.7, 460);
-  const vfH = Math.min((vfW * 4) / 3, screenH * 0.62);
-  const vfLeft = screenW / 2 - vfW / 2;
-  const vfTop = screenH * 0.42 - vfH / 2;
-
-  // Небольшой отступ внутрь — берём только то, что точно внутри рамки
-  const inset = 0.05;
-  const x = (vfLeft + offX + vfW * inset) / scale;
-  const y = (vfTop + offY + vfH * inset) / scale;
-  const cw = (vfW * (1 - inset * 2)) / scale;
-  const ch = (vfH * (1 - inset * 2)) / scale;
-
-  return {
-    x: Math.max(0, Math.floor(x)),
-    y: Math.max(0, Math.floor(y)),
-    w: Math.min(videoW - Math.max(0, Math.floor(x)), Math.ceil(cw)),
-    h: Math.min(videoH - Math.max(0, Math.floor(y)), Math.ceil(ch)),
-  };
-}
-
-/*
- * Определяем прямоугольник дисплея по цвету: стекло LCD — крупная связная
- * область малонасыщенных средне-тёмных пикселей, а корпус прибора (синий
- * пластик, белые панели) отсекается по насыщенности и яркости.
- * Возвращает {x0, y0, x1, y1} в координатах кадра или null.
- */
-function detectDisplayBox(px, w, h) {
-  const s = 4; // анализ на уменьшенной сетке
-  const aw = Math.max(1, Math.floor(w / s));
-  const ah = Math.max(1, Math.floor(h / s));
-  const mask = new Uint8Array(aw * ah);
-  for (let y = 0; y < ah; y++) {
-    for (let x = 0; x < aw; x++) {
-      const p = ((y * s + (s >> 1)) * w + Math.min(w - 1, x * s + (s >> 1))) * 4;
-      const r = px[p], g = px[p + 1], b = px[p + 2];
-      const max = Math.max(r, g, b);
-      // Стекло LCD тёплое (оливковое: r > b), синий корпус — холодный (b > r),
-      // белые панели отсекаются по яркости
-      mask[y * aw + x] = r > b * 1.12 && max >= 35 && max <= 220 ? 1 : 0;
-    }
-  }
-
-  // Крупнейшая связная область (4-связность)
-  const seen = new Uint8Array(aw * ah);
-  let best = null;
-  const stack = [];
-  for (let i = 0; i < aw * ah; i++) {
-    if (!mask[i] || seen[i]) continue;
-    let area = 0, minX = aw, minY = ah, maxX = 0, maxY = 0;
-    stack.push(i);
-    seen[i] = 1;
-    while (stack.length) {
-      const p = stack.pop();
-      const x = p % aw, y = (p / aw) | 0;
-      area++;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack.push(p - 1); }
-      if (x < aw - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack.push(p + 1); }
-      if (y > 0 && mask[p - aw] && !seen[p - aw]) { seen[p - aw] = 1; stack.push(p - aw); }
-      if (y < ah - 1 && mask[p + aw] && !seen[p + aw]) { seen[p + aw] = 1; stack.push(p + aw); }
-    }
-    if (!best || area > best.area) best = { area, minX, minY, maxX, maxY };
-  }
-
-  // Область должна быть достаточно крупной, чтобы считаться дисплеем
-  if (!best || best.area < aw * ah * 0.04) return null;
-  return {
-    x0: Math.max(0, best.minX * s - 2),
-    y0: Math.max(0, best.minY * s - 2),
-    x1: Math.min(w, (best.maxX + 1) * s + 2),
-    y1: Math.min(h, (best.maxY + 1) * s + 2),
-  };
-}
-
-/* ------------------------------------------------------------
- * 10. Подготовка кадра к распознаванию
- *     Область дисплея -> адаптивная бинаризация (Брэдли) -> полярность
- * ------------------------------------------------------------ */
-
-function prepareOcrImage(source) {
-  // Семисегментный путь работает в исходном разрешении кропа: апскейл
-  // размывает штрихи сегментов, поэтому крупный кадр только уменьшаем
-  const k = source.height > 1000 ? 1000 / source.height : 1;
-  const w = Math.max(1, Math.round(source.width * k));
-  const h = Math.max(1, Math.round(source.height * k));
-
-  const canvas = $('ocrCanvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.imageSmoothingEnabled = k < 1;
-  ctx.drawImage(source, 0, 0, w, h);
-
-  const img = ctx.getImageData(0, 0, w, h);
-  const px = img.data;
-  const n = w * h;
-
-  // Серый + интегральное изображение для локальных средних
-  const gray = new Uint8Array(n);
-  for (let i = 0, p = 0; i < n; i++, p += 4) {
-    gray[i] = (px[p] * 299 + px[p + 1] * 587 + px[p + 2] * 114) / 1000 | 0;
-  }
-  const iw = w + 1;
-  const integral = new Float64Array(iw * (h + 1));
-  for (let y = 0; y < h; y++) {
-    let rowSum = 0;
-    for (let x = 0; x < w; x++) {
-      rowSum += gray[y * w + x];
-      integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
-    }
-  }
-
-  // Брэдли: пиксель чёрный, если заметно темнее локального среднего
-  const r = Math.max(8, Math.round(Math.min(w, h) / 14));
-  const t = 0.15;
-  const bin = new Uint8Array(n);
-  for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - r), y1 = Math.min(h - 1, y + r);
-    for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - r), x1 = Math.min(w - 1, x + r);
-      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
-      const s = integral[(y1 + 1) * iw + (x1 + 1)] - integral[y0 * iw + (x1 + 1)] -
-        integral[(y1 + 1) * iw + x0] + integral[y0 * iw + x0];
-      bin[y * w + x] = gray[y * w + x] < (s / area) * (1 - t) ? 1 : 0;
-    }
-  }
-
-  // Цифры должны быть меньшинством; тёмный фон дисплея инвертируем
-  let black = 0;
-  for (let i = 0; i < n; i++) black += bin[i];
-  if (black > n / 2) {
-    for (let i = 0; i < n; i++) bin[i] ^= 1;
-  }
-
-  // Отсекаем корпус прибора: оставляем бинаризацию только в области дисплея,
-  // иначе надписи корпуса («ВЕРХНЕЕ», «DIA.», «ПУЛЬС») ломают сегментацию строк
-  const box = detectDisplayBox(px, w, h);
-  if (box) {
-    for (let y = 0; y < h; y++) {
-      const rowOutside = y < box.y0 || y >= box.y1;
-      for (let x = 0; x < w; x++) {
-        if (rowOutside || x < box.x0 || x >= box.x1) bin[y * w + x] = 0;
-      }
-    }
-  }
-
-  // Мажоритарный фильтр 3x3: срезаем зернистость стекла LCD (муар от
-  // субпикселей экрана + шум матрицы); штрихи цифр остаются
-  const cleaned = new Uint8Array(n);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      let count = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        const r = i + dy * w;
-        count += bin[r - 1] + bin[r] + bin[r + 1];
-      }
-      cleaned[i] = count >= 5 ? 1 : 0;
-    }
-  }
-  bin.set(cleaned);
-
-  // Ч/б версию пишем в canvas — её получит Tesseract в резервном пути
-  for (let i = 0, p = 0; i < n; i++, p += 4) {
-    const v = bin[i] ? 0 : 255;
-    px[p] = px[p + 1] = px[p + 2] = v;
-    px[p + 3] = 255;
-  }
-  ctx.putImageData(img, 0, 0);
-
-  return { bin, w, h, dataUrl: canvas.toDataURL('image/png') };
-}
-
-/* ------------------------------------------------------------
- * 11. Распознавание семисегментных цифр (основной путь).
- *     Чистые функции без обращения к DOM.
- * ------------------------------------------------------------ */
-
-/* Эталонные маски: биты [a,b,c,d,e,f,g] — a-верх, b/c-право, d-низ, e/f-лево, g-центр.
- * У «7» два варианта: классический и с хвостом по f (шрифт тонометра). */
-const DIGIT_PATTERNS = {
-  0b1111110: '0', 0b0110000: '1', 0b1101101: '2', 0b1111001: '3',
-  0b0110011: '4', 0b1011011: '5', 0b1011111: '6', 0b1110000: '7',
-  0b1110010: '7', 0b1111111: '8', 0b1111011: '9',
+/* Слова-числительные, которые может вернуть распознаватель речи */
+const RU_NUM_WORDS = {
+  'ноль': 0, 'один': 1, 'одна': 1, 'два': 2, 'две': 2, 'три': 3,
+  'четыре': 4, 'пять': 5, 'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9,
+  'десять': 10, 'одиннадцать': 11, 'двенадцать': 12, 'тринадцать': 13,
+  'четырнадцать': 14, 'пятнадцать': 15, 'шестнадцать': 16,
+  'семнадцать': 17, 'восемнадцать': 18, 'девятнадцать': 19,
+  'двадцать': 20, 'тридцать': 30, 'сорок': 40, 'пятьдесят': 50,
+  'шестьдесят': 60, 'семьдесят': 70, 'восемьдесят': 80, 'девяносто': 90,
+  'сто': 100, 'двести': 200, 'триста': 300, 'четыреста': 400,
+  'пятьсот': 500, 'шестьсот': 600, 'семьсот': 700, 'восемьсот': 800,
+  'девятьсот': 900,
 };
 
-function findComponents(bin, w, h) {
-  const labels = new Int32Array(w * h).fill(-1);
-  const comps = [];
-  const stack = [];
-  for (let i = 0; i < w * h; i++) {
-    if (!bin[i] || labels[i] !== -1) continue;
-    const id = comps.length;
-    comps.push({ minX: w, minY: h, maxX: 0, maxY: 0, area: 0 });
-    stack.push(i);
-    labels[i] = id;
-    while (stack.length) {
-      const p = stack.pop();
-      const x = p % w, y = (p / w) | 0;
-      const c = comps[id];
-      c.area++;
-      if (x < c.minX) c.minX = x;
-      if (x > c.maxX) c.maxX = x;
-      if (y < c.minY) c.minY = y;
-      if (y > c.maxY) c.maxY = y;
-      const xs = x > 0, xr = x < w - 1, yu = y > 0, yd = y < h - 1;
-      if (xs && bin[p - 1] && labels[p - 1] === -1) { labels[p - 1] = id; stack.push(p - 1); }
-      if (xr && bin[p + 1] && labels[p + 1] === -1) { labels[p + 1] = id; stack.push(p + 1); }
-      if (yu && bin[p - w] && labels[p - w] === -1) { labels[p - w] = id; stack.push(p - w); }
-      if (yd && bin[p + w] && labels[p + w] === -1) { labels[p + w] = id; stack.push(p + w); }
-      if (xs && yu && bin[p - 1 - w] && labels[p - 1 - w] === -1) { labels[p - 1 - w] = id; stack.push(p - 1 - w); }
-      if (xr && yu && bin[p + 1 - w] && labels[p + 1 - w] === -1) { labels[p + 1 - w] = id; stack.push(p + 1 - w); }
-      if (xs && yd && bin[p - 1 + w] && labels[p - 1 + w] === -1) { labels[p - 1 + w] = id; stack.push(p - 1 + w); }
-      if (xr && yd && bin[p + 1 + w] && labels[p + 1 + w] === -1) { labels[p + 1 + w] = id; stack.push(p + 1 + w); }
-    }
-  }
-  return comps;
-}
-
-/* Маска полезных пикселей: без рамки, крупных пятен и точечного шума */
-function keepMask(bin, w, h) {
-  const keep = new Uint8Array(w * h);
-  for (const c of findComponents(bin, w, h)) {
-    const bw = c.maxX - c.minX + 1, bh = c.maxY - c.minY + 1;
-    if (c.area < 6 || bh > h * 0.45 || bw > w * 0.5) continue;
-    for (let y = c.minY; y <= c.maxY; y++) {
-      for (let x = c.minX; x <= c.maxX; x++) {
-        if (bin[y * w + x]) keep[y * w + x] = 1;
-      }
-    }
-  }
-  return keep;
-}
-
-/* Строки цифр по горизонтальной проекции.
- * Порог активности строки — относительный: редкие цепочки шума (блики по стеклу)
- * не должны склеивать полосы в одну, а ряд через тонкую «1» — разрывать её. */
-function findBands(keep, w, h) {
-  const minRow = Math.max(4, Math.round(w * 0.018));
-  const raw = [];
-  let start = -1;
-  for (let y = 0; y <= h; y++) {
-    let n = 0;
-    if (y < h) for (let x = 0; x < w; x++) n += keep[y * w + x];
-    const on = n >= minRow;
-    if (on && start === -1) start = y;
-    if (!on && start !== -1) { raw.push({ y0: start, y1: y - 1 }); start = -1; }
-  }
-  // склеиваем полосы, разделённые короткими (до 3 строк) провалами
-  const bands = [];
-  for (const r of raw) {
-    const last = bands[bands.length - 1];
-    if (last && r.y0 - last.y1 <= 4) last.y1 = r.y1;
-    else bands.push({ y0: r.y0, y1: r.y1 });
-  }
-  return bands.filter((b) => {
-    const bh = b.y1 - b.y0 + 1;
-    return bh >= h * 0.04 && bh <= h * 0.5;
-  });
-}
-
-/* Подбор наклона: перебираем shear, максимизируем долю пустых колонок —
- * правильный наклон уплотняет цифры и разделяет их промежутками */
-function bestSlope(pixels, bh, w) {
-  const shift = Math.ceil(0.45 * bh) + 1;
-  const uw = w + shift * 2;
-  let bestK = 0, bestScore = -1, bestDetail = -1;
-  for (let ki = -20; ki <= 20; ki++) {
-    const k = ki * 0.02;
-    const counts = new Int32Array(uw);
-    let minC = uw, maxC = 0;
-    for (let i = 0; i < pixels.length; i += 2) {
-      const xs = pixels[i] + Math.round(k * pixels[i + 1]) + shift;
-      if (xs < 0 || xs >= uw) continue;
-      counts[xs]++;
-      if (xs < minC) minC = xs;
-      if (xs > maxC) maxC = xs;
-    }
-    let zeros = 0, sq = 0;
-    for (let x = minC; x <= maxC; x++) {
-      if (!counts[x]) zeros++;
-      sq += counts[x] * counts[x];
-    }
-    const score = maxC >= minC ? zeros / (maxC - minC + 1) : 0;
-    if (score > bestScore + 1e-9 || (Math.abs(score - bestScore) <= 1e-9 && sq > bestDetail)) {
-      bestScore = score; bestK = k; bestDetail = sq;
-    }
-  }
-  return { k: bestK, shift, uw };
-}
-
-/* Доли чёрного в зонах семи сегментов (для выпрямленной цифры).
- * Вертикальные зоны ужаты по вертикали, чтобы перекладины a/d при наклоне
- * не затекали в f/e/b/c (иначе «7» ловит фантомный сегмент f). */
-const SEG_ZONES = {
-  a: [0.25, 0.75, 0.04, 0.26],
-  f: [0.02, 0.32, 0.24, 0.42],
-  b: [0.68, 0.98, 0.24, 0.42],
-  g: [0.25, 0.75, 0.42, 0.60],
-  e: [0.02, 0.32, 0.60, 0.78],
-  c: [0.68, 0.98, 0.60, 0.78],
-  d: [0.25, 0.75, 0.74, 0.98],
-};
-
-function classifyGlyph(glyph, gw, gh) {
-  const frac = (z) => {
-    const zone = SEG_ZONES[z];
-    let black = 0, total = 0;
-    for (let y = Math.floor(zone[2] * gh); y < Math.ceil(zone[3] * gh); y++) {
-      for (let x = Math.floor(zone[0] * gw); x < Math.ceil(zone[1] * gw); x++) {
-        total++;
-        if (glyph[y * gw + x]) black++;
-      }
-    }
-    return total ? black / total : 0;
-  };
-  const names = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
-  const f = {};
-  for (const nm of names) f[nm] = frac(nm);
-
-  // Узкий глиф со штрихами — единица (зоны сегментов для него бессмысленны)
-  if (gw / gh < 0.4) {
-    let black = 0;
-    for (let i = 0; i < glyph.length; i++) black += glyph[i];
-    if (black > 0.1 * gw * gh) return '1';
-  }
-
-  const code = names.reduce((acc, nm) => (acc << 1) | (f[nm] >= 0.35 ? 1 : 0), 0);
-  if (DIGIT_PATTERNS[code]) return DIGIT_PATTERNS[code];
-
-  // Хэмминг <= 1: правка одного сегмента допустима, только если он был
-  // на грани порога (сегмент с долей 0.74 явно включён — его «выключение»
-  // это не ошибка порога, а другая цифра)
-  const THR = 0.35;
-  let best = null, bestMargin = Infinity;
-  for (const pattern in DIGIT_PATTERNS) {
-    const diff = code ^ Number(pattern);
-    if (diff === 0 || (diff & (diff - 1)) !== 0) continue; // дистанция не 1
-    const idx = 6 - Math.round(Math.log2(diff)); // бит a — старший, g — младший
-    const margin = Math.abs(f[names[idx]] - THR);
-    if (margin <= 0.12 && margin < bestMargin) { bestMargin = margin; best = DIGIT_PATTERNS[pattern]; }
-  }
-  if (best) return best;
-
-  return '?';
-}
-
 /*
- * Главная функция распознавателя: бинаризованное изображение ->
- * текст вида "102\n86\n75" (строки через \n).
- * Строки по Y-проекции, наклон по перебору, цифры по X-проекции.
- * Надписи корпуса («ВЕРХНЕЕ», «DIA.», «ПУЛЬС») отсекаются по высоте:
- * настоящие цифры — самые высокие глифы в кадре.
+ * Разбор произнесённой фразы: «Сто двадцать на восемьдесят, пульс семьдесят»
+ * -> { sys: '120', dia: '80', pul: '70' }.
+ * Слова-числительные складываются в группы (сотни+десятки+единицы),
+ * разделители групп — слова-не-числительные и цифры. Назначение: сначала
+ * по ключевым словам (пульс / верхнее / нижнее), затем по порядку чтения
+ * с проверкой диапазонов LIMITS.
  */
-function recognizeSevenSeg(bin, w, h) {
-  const keep = keepMask(bin, w, h);
-  const bands = findBands(keep, w, h);
-
-  // Активная область по горизонтали (после отсечения корпуса это дисплей)
-  let actMinX = w, actMaxX = 0;
-  for (let i = 0; i < w * h; i++) {
-    if (bin[i]) {
-      const x = i % w;
-      if (x < actMinX) actMinX = x;
-      if (x > actMaxX) actMaxX = x;
-    }
-  }
-  const edgeZone = Math.max(6, (actMaxX - actMinX) * 0.04);
-
-  // 1) Собираем боксы глифов по всем строкам, классификация — позже
-  const bandBoxes = [];
-  let maxGh = 0;
-  for (const band of bands) {
-    const bh = band.y1 - band.y0 + 1;
-
-    const pixels = [];
-    for (let y = 0; y < bh; y++) {
-      for (let x = 0; x < w; x++) {
-        if (keep[(band.y0 + y) * w + x]) pixels.push(x, y);
-      }
-    }
-
-    const { k, shift, uw } = bestSlope(pixels, bh, w);
-
-    // Выпрямленная строка
-    const upright = new Uint8Array(uw * bh);
-    for (let i = 0; i < pixels.length; i += 2) {
-      const xs = pixels[i] + Math.round(k * pixels[i + 1]) + shift;
-      upright[pixels[i + 1] * uw + xs] = 1;
-    }
-
-    // Глифы по X-проекции выпрямленной строки
-    const boxes = [];
-    let cs = -1;
-    for (let x = 0; x <= uw; x++) {
-      let n = 0;
-      if (x < uw) for (let y = 0; y < bh; y++) n += upright[y * uw + x];
-      const on = n >= 2;
-      if (on && cs === -1) cs = x;
-      if (!on && cs !== -1) {
-        const bx0 = cs, bw = x - cs;
-        cs = -1;
-        if (bw < 5) continue;
-
-        // Вырезаем глиф и обрезаем пустые строки сверху/снизу
-        const grid = [];
-        for (let y = 0; y < bh; y++) {
-          const row = [];
-          for (let gx = 0; gx < bw; gx++) row.push(upright[y * uw + bx0 + gx]);
-          grid.push(row);
-        }
-        let ty = 0, by = bh - 1;
-        const rowSum = (r) => grid[r].reduce((s, v) => s + v, 0);
-        while (ty < by && rowSum(ty) === 0) ty++;
-        while (by > ty && rowSum(by) === 0) by--;
-        const gh = by - ty + 1;
-        if (gh < bh * 0.4 || gh > bh * 1.3) continue;
-        if (bw / gh > 1.2) continue;
-
-        const glyph = [];
-        for (let y = ty; y <= by; y++) for (let gx = 0; gx < bw; gx++) glyph.push(grid[y][gx]);
-
-        boxes.push({ bx0, bw, glyph, gh });
-        if (gh > maxGh) maxGh = gh;
-      }
-    }
-    bandBoxes.push({ shift, boxes });
-  }
-
-  // 2) Классификация: отсекаем надписи корпуса (они заметно ниже цифр)
-  const lines = [];
-  for (const { shift, boxes } of bandBoxes) {
-    let lineText = '';
-    let prevMaxX = -999, prevW = 0;
-    for (const b of boxes) {
-      if (b.gh < maxGh * 0.5) continue;
-      const ch = classifyGlyph(b.glyph, b.bw, b.gh);
-      if (ch === '?') continue;
-      // Рамка дисплея даёт узкие вертикальные обрывки у краёв — это не «единицы»
-      const origCenter = b.bx0 + b.bw / 2 - shift;
-      if (b.bw / b.gh < 0.4 &&
-          (origCenter - actMinX < edgeZone || actMaxX - origCenter < edgeZone)) continue;
-      if (lineText && b.bx0 - prevMaxX > 0.6 * prevW) lineText += ' ';
-      lineText += ch;
-      prevMaxX = b.bx0 + b.bw;
-      prevW = b.bw;
-    }
-    if (lineText) lines.push(lineText);
-  }
-  return lines.join('\n');
-}
-
-/* ------------------------------------------------------------
- * 12. Разбор показаний из распознанного текста.
- *     Учитывает обе компоновки:
- *      - «120/80 78» в одну строку (разделитель / \ | : -);
- *      - столбик: SYS сверху, DIA ниже, пульс последним (большинство тонометров).
- * ------------------------------------------------------------ */
-
-function parseVitals(rawText) {
+function parseVoiceVitals(raw) {
   const result = { sys: '', dia: '', pul: '' };
-  if (!rawText) return result;
-  const text = String(rawText);
+  if (!raw) return result;
+  const text = String(raw)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[-–—/\\,.:;!?+()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return result;
 
   const inRange = (v, range) => v >= range[0] && v <= range[1];
 
-  // Все группы из 2-3 цифр в порядке чтения; пара «120/80» даёт две записи
+  // Собираем группы чисел; перед группой — последнее ключевое слово
   const groups = [];
-  const groupRe = /\d{2,3}(?:\s*[/\\|:-]\s*\d{2,3})?/g;
-  let m;
-  while ((m = groupRe.exec(text)) !== null) {
-    const parts = m[0].split(/[^0-9]/).filter(Boolean);
-    for (const part of parts) {
-      groups.push({ v: Number(part), from: m.index, to: m.index + m[0].length });
+  let keyword = '';
+  let composed = null; // { h, t, u } — сотни/десятки/единицы текущей группы
+
+  const flush = () => {
+    if (composed) {
+      const v = composed.h + composed.t + composed.u;
+      if (v > 0) groups.push({ value: v, keyword });
+      composed = null;
+    }
+  };
+
+  for (const token of text.split(' ')) {
+    if (/^\d{1,3}$/.test(token)) {
+      flush();
+      groups.push({ value: Number(token), keyword });
+      keyword = ''; // ключевое слово «израсходовано» этой группой
+      continue;
+    }
+    const word = RU_NUM_WORDS[token];
+    if (word !== undefined) {
+      if (!composed) composed = { h: 0, t: 0, u: 0 };
+      if (word >= 100 && !composed.h) composed.h = word;
+      else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
+      else if (word < 20 && !composed.u) composed.u = word;
+      else { flush(); composed = { h: word >= 100 ? word : 0, t: word >= 20 && word < 100 ? word : 0, u: word < 20 ? word : 0 }; }
+      continue;
+    }
+    // Слово-не-числительное завершает текущую группу
+    flush();
+    if (/^(пульс|пульса|пульсом|удар|удара|ударов|сердц)/.test(token)) keyword = 'pul';
+    else if (/^(верхн|систол)/.test(token)) keyword = 'sys';
+    else if (/^(нижн|диастол)/.test(token)) keyword = 'dia';
+    else keyword = ''; // прочие слова сбрасывают ключевое слово
+  }
+  flush();
+
+  // 1) Группы с ключевыми словами
+  const used = new Array(groups.length).fill(false);
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (!g.keyword || used[i]) continue;
+    if (g.keyword === 'sys' && !result.sys && inRange(g.value, LIMITS.sys)) {
+      result.sys = String(g.value); used[i] = true;
+    } else if (g.keyword === 'dia' && !result.dia && inRange(g.value, LIMITS.dia)) {
+      result.dia = String(g.value); used[i] = true;
+    } else if (g.keyword === 'pul' && !result.pul && inRange(g.value, LIMITS.pul)) {
+      result.pul = String(g.value); used[i] = true;
     }
   }
 
-  const used = [];
-  const isUsed = (g) => used.some(([a, b]) => g.from >= a && g.to <= b);
-
-  // 1) Явная пара «SYS/DIA» с разделителем
-  const pair = text.match(/(\d{2,3})\s*[/\\|:-]\s*(\d{2,3})/);
-  if (pair) {
-    const s = Number(pair[1]);
-    const d = Number(pair[2]);
-    if (inRange(s, LIMITS.sys) && inRange(d, LIMITS.dia) && s > d) {
-      result.sys = String(s);
-      result.dia = String(d);
-      used.push([pair.index, pair.index + pair[0].length]);
+  // 2) Фолбэк по порядку чтения: SYS, затем DIA < SYS, затем пульс
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (used[i]) continue;
+    if (!result.sys && inRange(g.value, LIMITS.sys)) {
+      result.sys = String(g.value); used[i] = true;
+      continue;
     }
-  }
-
-  // 2) Пульс рядом со словом-меткой (если метки попали в кадр)
-  const pulseWord = text.match(/(?:pulse?|pul|pr|bpm|hr)[^0-9]{0,10}(\d{2,3})/i);
-  if (pulseWord) {
-    result.pul = pulseWord[1];
-    const from = pulseWord.index + pulseWord[0].lastIndexOf(pulseWord[1]);
-    used.push([from, from + pulseWord[1].length]);
-  }
-
-  // 3) Вертикальная компоновка: сверху вниз — первая правдоподобная группа SYS,
-  //    следующая меньшая DIA, затем пульс
-  if (!result.sys) {
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
-      if (isUsed(g) || !inRange(g.v, LIMITS.sys)) continue;
-      result.sys = String(g.v);
-      for (let j = i + 1; j < groups.length; j++) {
-        const d = groups[j];
-        if (isUsed(d)) continue;
-        if (!result.dia && inRange(d.v, LIMITS.dia) && d.v < g.v) {
-          result.dia = String(d.v);
-          continue;
-        }
-        if (result.dia && !result.pul && inRange(d.v, LIMITS.pul)) {
-          result.pul = String(d.v);
-          break;
-        }
-      }
-      break;
+    if (result.sys && !result.dia && inRange(g.value, LIMITS.dia) && g.value < Number(result.sys)) {
+      result.dia = String(g.value); used[i] = true;
+      continue;
+    }
+    if (result.sys && result.dia && !result.pul && inRange(g.value, LIMITS.pul)) {
+      result.pul = String(g.value); used[i] = true;
     }
   }
 
   return result;
 }
 
-/* ------------------------------------------------------------
- * 13. OCR: снимок -> распознавание -> поля проверки
- * ------------------------------------------------------------ */
-
-function captureShot() {
-  const video = $('scannerVideo');
-  if (!cameraStream || video.readyState < 2) return; // поток ещё не готов
-
-  const canvas = $('captureCanvas');
-  const crop = getViewfinderCrop(video);
-  if (crop && crop.w > 80 && crop.h > 80) {
-    canvas.width = crop.w;
-    canvas.height = crop.h;
-    canvas.getContext('2d').drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
-  } else {
-    // Рамку не удалось сопоставить с потоком — берём весь кадр
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+function openVoiceInput() {
+  setModal($('voiceModal'), true);
+  if (!SpeechRec) {
+    showVoiceError('Голосовой ввод не поддерживается этим браузером. Введите показания вручную.');
+    return;
   }
-  currentShot = canvas.toDataURL('image/jpeg', 0.92);
-
-  const prepared = prepareOcrImage(canvas);
-  prepared.info = video.videoWidth
-    ? `Кадр ${video.videoWidth}×${video.videoHeight} → область ${canvas.width}×${canvas.height} → ч/б ${prepared.w}×${prepared.h}`
-    : '';
-  stopCamera();
-  setModal($('cameraModal'), false);
-  openReview(currentShot, prepared);
+  startListening();
 }
 
-function openReview(shotDataUrl, prepared) {
-  $('shotPreview').src = shotDataUrl;
-  $('ocrDebugImage').src = prepared.dataUrl;
-  $('ocrDebugInfo').textContent = prepared.info || '';
-  $('reviewSys').value = '';
-  $('reviewDia').value = '';
-  $('reviewPul').value = '';
-  $('reviewComment').value = '';
-  $('ocrRawText').textContent = '—';
-  $('ocrProgressBar').style.width = '0%';
-  $('ocrProgress').hidden = false;
-  $('reviewFields').hidden = true;
-  setModal($('reviewModal'), true);
-  void runOcr(shotDataUrl, prepared);
-}
+function startListening() {
+  $('voiceError').hidden = true;
+  $('voiceRetryBtn').hidden = true;
+  $('micWrap').classList.remove('is-idle');
+  $('voiceStatus').textContent = 'Слушаю… Произнесите показания (например: 120 на 80, пульс 70)';
 
-function closeReview() {
-  currentShot = null; // «остывшие» результаты распознавания игнорируются
-  setModal($('reviewModal'), false);
-}
+  // Инстансы SpeechRecognition одноразовые — создаём на каждое прослушивание
+  recognition = new SpeechRec();
+  recognition.lang = 'ru-RU';
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 3;
+  voiceActive = true;
+  voiceGotResult = false;
 
-function setOcrProgress(ratio) {
-  $('ocrProgressBar').style.width = `${Math.round(ratio * 100)}%`;
-}
+  recognition.onresult = (event) => {
+    voiceGotResult = true;
+    voiceActive = false;
 
-function parseScore(parsed) {
-  return (parsed.sys ? 1 : 0) + (parsed.dia ? 1 : 0) + (parsed.pul ? 1 : 0);
-}
+    // Перебираем альтернативы распознавания: берём первую, где нашлись SYS и DIA
+    let best = null, bestHeard = '';
+    const alternatives = event.results[0] || [];
+    for (let i = 0; i < alternatives.length; i++) {
+      const heard = alternatives[i].transcript || '';
+      const parsed = parseVoiceVitals(heard);
+      const better = !best || ((parsed.sys && parsed.dia) && !(best.sys && best.dia));
+      if (better) { best = parsed; bestHeard = heard; }
+      if (best.sys && best.dia) break;
+    }
 
-/* Ленивый воркер Tesseract (резервный путь) */
-async function getOcrWorker() {
-  if (!ocrWorker) ocrWorker = await Tesseract.createWorker('eng');
-  return ocrWorker;
-}
+    closeVoiceModal();
+    openVoiceReview(best, bestHeard);
+  };
 
-async function recognizeWithTesseract(imageDataUrl, shotDataUrl) {
-  const worker = await getOcrWorker();
-  let bestText = '', bestScore = -1;
-  for (const psm of ['6', '11']) { // единый блок, затем разрозненный текст
-    await worker.setParameters({
-      tessedit_char_whitelist: '0123456789/',
-      tessedit_pageseg_mode: psm,
-    });
-    const { data } = await worker.recognize(imageDataUrl);
-    if (currentShot !== shotDataUrl) return null; // окно закрыли / пересняли
-    const text = data.text || '';
-    const score = parseScore(parseVitals(text));
-    if (score > bestScore) { bestScore = score; bestText = text; }
-    if (bestScore >= 3) break;
+  recognition.onerror = (event) => {
+    voiceGotResult = true; // onend после ошибки не должен писать «не расслышал»
+    const messages = {
+      'not-allowed': 'Доступ к микрофону запрещён. Разрешите его в настройках браузера и попробуйте снова.',
+      'service-not-allowed': 'Распознавание речи недоступно. Если приложение открыто с домашнего экрана, откройте его в Safari.',
+      'no-speech': 'Речь не распознана. Говорите ближе к микрофону.',
+      'audio-capture': 'Микрофон не найден на этом устройстве.',
+      'network': 'Для распознавания речи нужен интернет.',
+    };
+    showVoiceError(messages[event.error] || 'Не удалось распознать речь. Попробуйте ещё раз.');
+  };
+
+  recognition.onend = () => {
+    if (voiceActive && !voiceGotResult) {
+      voiceActive = false;
+      showVoiceError('Не расслышал ни одного слова. Нажмите «Слушать ещё раз» и произнесите показания.');
+    }
+  };
+
+  try {
+    recognition.start();
+  } catch {
+    /* попытка стартовать уже запущенный инстанс — не критично */
   }
-  return { text: bestText, score: bestScore };
 }
 
-function finishOcr(parsed, rawText, ok) {
-  $('ocrProgress').hidden = true;
-  $('ocrRawText').textContent = (rawText || '').trim() || '—';
+function showVoiceError(message) {
+  voiceActive = false;
+  $('micWrap').classList.add('is-idle');
+  $('voiceStatus').textContent = 'Голосовой ввод';
+  $('voiceErrorText').textContent = message;
+  $('voiceError').hidden = false;
+  $('voiceRetryBtn').hidden = false;
+}
+
+function closeVoiceModal() {
+  voiceActive = false;
+  setModal($('voiceModal'), false);
+}
+
+function closeVoiceInput() {
+  if (recognition) recognition.abort();
+  closeVoiceModal();
+}
+
+/* Экран проверки: подставляем распознанные числа, пользователь правит и сохраняет */
+function openVoiceReview(vitals, heardText) {
+  const parsed = vitals || { sys: '', dia: '', pul: '' };
+  $('heardText').textContent = (heardText || '').trim() || '—';
   $('reviewSys').value = parsed.sys;
   $('reviewDia').value = parsed.dia;
   $('reviewPul').value = parsed.pul;
-  $('reviewFields').hidden = false;
-  if (!ok) showToast('Показания не распознались — введите вручную', 'error');
-  else if (!parsed.pul) showToast('Распознались не все цифры — проверьте поля', 'info');
+  $('reviewComment').value = '';
+  setModal($('reviewModal'), true);
+  refreshIcons();
+  if (!parsed.sys || !parsed.dia) {
+    showToast('Не удалось распознать показания — введите их вручную', 'error');
+  } else if (!parsed.pul) {
+    showToast('Распознались не все цифры — проверьте поля', 'info');
+  }
 }
 
-async function runOcr(shotDataUrl, prepared) {
-  if (currentShot !== shotDataUrl) return;
-
-  // 1) Быстрый путь: семисегментный распознаватель (мгновенно и офлайн)
-  let text = '';
-  let best = { sys: '', dia: '', pul: '' };
-  let bestScore = -1;
-  try {
-    text = recognizeSevenSeg(prepared.bin, prepared.w, prepared.h);
-    best = parseVitals(text);
-    bestScore = parseScore(best);
-  } catch (err) {
-    console.warn('[МедЖурнал] Семисегментный распознаватель:', err);
-  }
-
-  // 2) Резерв: Tesseract по ч/б кадру (нужен интернет при первом запуске)
-  if (bestScore < 2) {
-    if (typeof Tesseract === 'undefined') {
-      finishOcr(best, text, false);
-      return;
-    }
-    try {
-      $('ocrProgressText').textContent = 'Пробую резервное распознавание…';
-      const result = await recognizeWithTesseract(prepared.dataUrl, shotDataUrl);
-      if (!result) return;
-      if (result.score > bestScore) {
-        best = parseVitals(result.text);
-        text = result.text;
-        bestScore = result.score;
-      }
-    } catch (err) {
-      console.warn('[МедЖурнал] OCR Tesseract:', err);
-    }
-    if (currentShot !== shotDataUrl) return;
-  }
-
-  finishOcr(best, text, bestScore >= 2);
-}
-
-/* Сохранение проверенных показаний из окна проверки */
+/* Сохранение проверенных показаний */
 function onSaveReview() {
   const vitals = {
     sys: parseInt($('reviewSys').value, 10),
@@ -1024,8 +496,12 @@ function onSaveReview() {
   showToast('Измерение сохранено', 'success');
 }
 
+function closeReview() {
+  setModal($('reviewModal'), false);
+}
+
 /* ------------------------------------------------------------
- * 14. Экспорт в CSV
+ * 10. Экспорт в CSV
  * ------------------------------------------------------------ */
 
 function exportCsv() {
@@ -1059,38 +535,35 @@ function exportCsv() {
 }
 
 /* ------------------------------------------------------------
- * 15. Привязка событий и запуск
+ * 11. Привязка событий и запуск
  * ------------------------------------------------------------ */
 
 function bindEvents() {
   // Ручной ввод
   $('manualForm').addEventListener('submit', onManualSubmit);
 
-  // Сканирование
-  $('scanBtn').addEventListener('click', openScanner);
-  $('shotBtn').addEventListener('click', captureShot);
-  $('cancelScanBtn').addEventListener('click', closeScanner);
+  // Голосовой ввод
+  $('voiceBtn').addEventListener('click', openVoiceInput);
+  $('voiceCloseBtn').addEventListener('click', closeVoiceInput);
+  $('voiceRetryBtn').addEventListener('click', startListening);
 
   // Проверка распознанного
-  $('retakeBtn').addEventListener('click', () => {
-    closeReview();
-    openScanner();
-  });
-  $('saveScanBtn').addEventListener('click', onSaveReview);
+  $('editBtn').addEventListener('click', closeReview);
+  $('saveReviewBtn').addEventListener('click', onSaveReview);
   $('reviewCancelBtn').addEventListener('click', closeReview);
 
   // Закрытие модалок: клик по фону и Esc
   document.querySelectorAll('.modal').forEach((modal) => {
     modal.addEventListener('click', (event) => {
       if (!event.target.classList.contains('modal-backdrop')) return;
-      if (modal.id === 'cameraModal') closeScanner();
+      if (modal.id === 'voiceModal') closeVoiceInput();
       else closeReview();
     });
   });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if ($('reviewModal').classList.contains('open')) closeReview();
-    else if ($('cameraModal').classList.contains('open')) closeScanner();
+    else if ($('voiceModal').classList.contains('open')) closeVoiceInput();
   });
 
   // Удаление записей (делегирование)
@@ -1106,10 +579,10 @@ function bindEvents() {
   // Экспорт
   $('exportBtn').addEventListener('click', exportCsv);
 
-  // Освобождаем камеру, когда страница уходит в фон
-  window.addEventListener('pagehide', stopCamera);
+  // Останавливаем распознавание, когда страница уходит в фон
+  window.addEventListener('pagehide', closeVoiceInput);
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && $('cameraModal').classList.contains('open')) closeScanner();
+    if (document.hidden && $('voiceModal').classList.contains('open')) closeVoiceInput();
   });
 }
 
