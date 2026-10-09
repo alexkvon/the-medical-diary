@@ -294,8 +294,9 @@ function parseVoiceVitals(raw) {
   const rawTokens = String(raw).trim().split(/\s+/).filter(Boolean);
   if (!rawTokens.length) return result;
 
-  // Нормализация отдельного токена: регистр, ё, пунктуация внутри слова
-  const norm = (t) => t.toLowerCase().replace(/ё/g, 'е').replace(/[-–—/\\,.:;!?+()]/g, '');
+  // Нормализация отдельного токена: регистр, ё; разделители (дефисы, слэши,
+  // запятые) превращаются в пробелы — «122-83-75» распадётся на три числа
+  const norm = (t) => t.toLowerCase().replace(/ё/g, 'е').replace(/[-–—/\\,.:;!?+()]/g, ' ');
 
   const inRange = (v, range) => v >= range[0] && v <= range[1];
 
@@ -314,31 +315,33 @@ function parseVoiceVitals(raw) {
   };
 
   for (let i = 0; i < rawTokens.length; i++) {
-    const token = norm(rawTokens[i]);
-    if (!token) continue; // токен состоял только из пунктуации
-    if (/^\d{1,3}$/.test(token)) {
+    // Один сырой токен может распасться на несколько («122-83-75» -> 122, 83, 75)
+    const pieces = norm(rawTokens[i]).split(' ').filter(Boolean);
+    for (const token of pieces) {
+      if (/^\d{1,3}$/.test(token)) {
+        flush();
+        groups.push({ value: Number(token), keyword, endToken: i });
+        lastNumToken = i;
+        keyword = ''; // ключевое слово «израсходовано» этой группой
+        continue;
+      }
+      const word = RU_NUM_WORDS[token];
+      if (word !== undefined) {
+        lastNumToken = i;
+        if (!composed) composed = { h: 0, t: 0, u: 0 };
+        if (word >= 100 && !composed.h) composed.h = word;
+        else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
+        else if (word < 20 && !composed.u) composed.u = word;
+        else { flush(); composed = { h: word >= 100 ? word : 0, t: word >= 20 && word < 100 ? word : 0, u: word < 20 ? word : 0 }; }
+        continue;
+      }
+      // Слово-не-числительное завершает текущую группу
       flush();
-      groups.push({ value: Number(token), keyword, endToken: i });
-      lastNumToken = i;
-      keyword = ''; // ключевое слово «израсходовано» этой группой
-      continue;
+      if (/^(пульс|пульса|пульсом|удар|удара|ударов|сердц)/.test(token)) keyword = 'pul';
+      else if (/^(верхн|систол)/.test(token)) keyword = 'sys';
+      else if (/^(нижн|диастол)/.test(token)) keyword = 'dia';
+      else keyword = ''; // прочие слова сбрасывают ключевое слово
     }
-    const word = RU_NUM_WORDS[token];
-    if (word !== undefined) {
-      lastNumToken = i;
-      if (!composed) composed = { h: 0, t: 0, u: 0 };
-      if (word >= 100 && !composed.h) composed.h = word;
-      else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
-      else if (word < 20 && !composed.u) composed.u = word;
-      else { flush(); composed = { h: word >= 100 ? word : 0, t: word >= 20 && word < 100 ? word : 0, u: word < 20 ? word : 0 }; }
-      continue;
-    }
-    // Слово-не-числительное завершает текущую группу
-    flush();
-    if (/^(пульс|пульса|пульсом|удар|удара|ударов|сердц)/.test(token)) keyword = 'pul';
-    else if (/^(верхн|систол)/.test(token)) keyword = 'sys';
-    else if (/^(нижн|диастол)/.test(token)) keyword = 'dia';
-    else keyword = ''; // прочие слова сбрасывают ключевое слово
   }
   flush();
 
