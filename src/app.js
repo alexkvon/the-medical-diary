@@ -281,48 +281,51 @@ const RU_NUM_WORDS = {
 };
 
 /*
- * Разбор произнесённой фразы: «Сто двадцать на восемьдесят, пульс семьдесят»
- * -> { sys: '120', dia: '80', pul: '70' }.
+ * Разбор произнесённой фразы: «Сто двадцать на восемьдесят, пульс семьдесят,
+ * подъём по лестнице» -> { sys: '120', dia: '80', pul: '70', comment: '...' }.
  * Слова-числительные складываются в группы (сотни+десятки+единицы),
  * разделители групп — слова-не-числительные и цифры. Назначение: сначала
  * по ключевым словам (пульс / верхнее / нижнее), затем по порядку чтения
- * с проверкой диапазонов LIMITS.
+ * с проверкой диапазонов LIMITS. Текст после последнего числа — комментарий.
  */
 function parseVoiceVitals(raw) {
-  const result = { sys: '', dia: '', pul: '' };
+  const result = { sys: '', dia: '', pul: '', comment: '' };
   if (!raw) return result;
-  const text = String(raw)
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/[-–—/\\,.:;!?+()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return result;
+  const rawTokens = String(raw).trim().split(/\s+/).filter(Boolean);
+  if (!rawTokens.length) return result;
+
+  // Нормализация отдельного токена: регистр, ё, пунктуация внутри слова
+  const norm = (t) => t.toLowerCase().replace(/ё/g, 'е').replace(/[-–—/\\,.:;!?+()]/g, '');
 
   const inRange = (v, range) => v >= range[0] && v <= range[1];
 
   // Собираем группы чисел; перед группой — последнее ключевое слово
   const groups = [];
   let keyword = '';
-  let composed = null; // { h, t, u } — сотни/десятки/единицы текущей группы
+  let composed = null;   // { h, t, u } — сотни/десятки/единицы текущей группы
+  let lastNumToken = -1; // индекс последнего токена, вошедшего в число
 
   const flush = () => {
     if (composed) {
       const v = composed.h + composed.t + composed.u;
-      if (v > 0) groups.push({ value: v, keyword });
+      if (v > 0) groups.push({ value: v, keyword, endToken: lastNumToken });
       composed = null;
     }
   };
 
-  for (const token of text.split(' ')) {
+  for (let i = 0; i < rawTokens.length; i++) {
+    const token = norm(rawTokens[i]);
+    if (!token) continue; // токен состоял только из пунктуации
     if (/^\d{1,3}$/.test(token)) {
       flush();
-      groups.push({ value: Number(token), keyword });
+      groups.push({ value: Number(token), keyword, endToken: i });
+      lastNumToken = i;
       keyword = ''; // ключевое слово «израсходовано» этой группой
       continue;
     }
     const word = RU_NUM_WORDS[token];
     if (word !== undefined) {
+      lastNumToken = i;
       if (!composed) composed = { h: 0, t: 0, u: 0 };
       if (word >= 100 && !composed.h) composed.h = word;
       else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
@@ -369,6 +372,20 @@ function parseVoiceVitals(raw) {
       result.pul = String(g.value); used[i] = true;
     }
   }
+
+  // Комментарий: всё, что произнесено после последнего распознанного числа
+  let lastEnd = -1;
+  for (let i = 0; i < groups.length; i++) {
+    if (used[i]) lastEnd = Math.max(lastEnd, groups[i].endToken);
+  }
+  const tail = rawTokens.slice(lastEnd + 1)
+    .filter((t) => !/^(пульс|пульса|пульсом|давление|удар|удара|ударов)$/i.test(norm(t)));
+  let comment = tail.join(' ').trim();
+  if (comment) comment = comment.charAt(0).toUpperCase() + comment.slice(1);
+  if (comment.length > 300) comment = comment.slice(0, 300);
+  // Без распознанных показаний хвост фразы — не комментарий, а мусор
+  if (!result.sys && !result.dia) comment = '';
+  result.comment = comment;
 
   return result;
 }
@@ -462,12 +479,12 @@ function closeVoiceInput() {
 
 /* Экран проверки: подставляем распознанные числа, пользователь правит и сохраняет */
 function openVoiceReview(vitals, heardText) {
-  const parsed = vitals || { sys: '', dia: '', pul: '' };
+  const parsed = vitals || { sys: '', dia: '', pul: '', comment: '' };
   $('heardText').textContent = (heardText || '').trim() || '—';
   $('reviewSys').value = parsed.sys;
   $('reviewDia').value = parsed.dia;
   $('reviewPul').value = parsed.pul;
-  $('reviewComment').value = '';
+  $('reviewComment').value = parsed.comment || '';
   setModal($('reviewModal'), true);
   refreshIcons();
   if (!parsed.sys || !parsed.dia) {
