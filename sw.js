@@ -2,8 +2,8 @@
  * МедЖурнал — Service Worker (offline-first)
  *
  * Стратегии кэширования:
- *  - навигации (index.html)     → сеть, при офлайне — кэш;
- *  - свои файлы (same-origin)   → кэш мгновенно + фоновое обновление;
+ *  - свои файлы (same-origin, включая навигации) → сеть, при офлайне — кэш:
+ *    новая версия app.js применяется уже при следующей загрузке страницы;
  *  - CDN (cross-origin)         → кэш, при промахе — сеть и сохранение.
  *
  * Пути относительные (./), чтобы воркер работал в подпапке GitHub Pages.
@@ -11,7 +11,9 @@
 
 'use strict';
 
-const CACHE_NAME = 'medjournal-cache-v9';
+// Версия кэша: менять при каждом изменении файлов оболочки (app.js и др.),
+// чтобы install заново прогрел кэш со свежими файлами
+const CACHE_NAME = 'medjournal-cache-v10';
 
 /* Ядро приложения — кэшируем на этапе install строго */
 const APP_SHELL = [
@@ -62,44 +64,26 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
-  // Переходы по страницам — сначала сеть
-  if (request.mode === 'navigate') {
-    event.respondWith(networkFirst(request));
-    return;
-  }
-
   event.respondWith(
     url.origin === self.location.origin
-      ? staleWhileRevalidate(request)
+      ? networkFirst(request, request.mode === 'navigate')
       : cacheFirst(request)
   );
 });
 
-/* Сеть → при ошибке/офлайне кэш (страницы приложения) */
-async function networkFirst(request) {
+/* Сеть → при офлайне кэш; для навигаций последний рубеж — index.html */
+async function networkFirst(request, isNavigation) {
   const cache = await caches.open(CACHE_NAME);
   try {
     const response = await fetch(request);
     if (response && response.ok) cache.put(request, response.clone());
     return response;
   } catch (err) {
-    const cached = (await cache.match(request)) || (await cache.match('./index.html'));
+    const cached = (await cache.match(request)) ||
+      (isNavigation && (await cache.match('./index.html')));
     if (cached) return cached;
     throw err;
   }
-}
-
-/* Кэш мгновенно, обновление в фоне (css/js/иконки приложения) */
-async function staleWhileRevalidate(request) {
-  const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match(request);
-  const network = fetch(request)
-    .then((response) => {
-      if (response && response.ok) cache.put(request, response.clone());
-      return response;
-    })
-    .catch(() => undefined);
-  return cached || (await network) || Response.error();
 }
 
 /* Кэш → при промахе сеть и сохранение (CDN-библиотеки: Tailwind, Lucide) */
