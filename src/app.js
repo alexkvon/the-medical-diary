@@ -46,8 +46,9 @@ let toastTimer = null;
 let recognition = null;   // текущий инстанс SpeechRecognition
 let voiceActive = false;  // слушаем прямо сейчас
 let voiceGotResult = false; // пришли ли хоть какие-то данные
-let voiceTranscript = ''; // накопленный финальный текст всех сегментов
+let voiceFinals = [];     // финальные сегменты всех сессий текущей записи
 let voiceStoppedByUser = false; // слушание остановлено кнопкой «Стоп»
+let restartTimer = null;  // отложенный перезапуск сессии после тишины
 
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -410,39 +411,45 @@ function startListening() {
   $('micWrap').classList.remove('is-idle');
   $('voiceStatus').textContent = 'Слушаю… Произнесите показания и нажмите «Стоп»';
 
+  clearTimeout(restartTimer);
+
   // Инстансы SpeechRecognition одноразовые — создаём на каждое прослушивание
   recognition = new SpeechRec();
   recognition.lang = 'ru-RU';
-  recognition.continuous = true;     // пауза не обрывает запись — ждём «Стоп»
+  // continuous не используем: на Android Chrome он «эхом» повторяет сказанное.
+  // Каждая фраза — отдельная короткая сессия; заминки переживаем тем, что
+  // в onend тихо перезапускаем сессию, пока не нажата «Стоп» (длину паузы
+  // настроить нельзя — endpointing целиком на стороне движка)
+  recognition.continuous = false;
   recognition.interimResults = true; // показываем текст по мере речи
   recognition.maxAlternatives = 3;
   voiceActive = true;
   voiceGotResult = false;
-  voiceTranscript = '';
+  voiceFinals = [];
   voiceStoppedByUser = false;
 
   recognition.onresult = (event) => {
     voiceGotResult = true;
-    // event.results накопительный: собираем финальные сегменты и черновик
+    // Финальные сегменты дополняем по resultIndex (results накопительный),
+    // а повторы и дорастания потом схлопывает mergeVoiceSegments
     let interim = '';
-    const finals = [];
-    for (let i = 0; i < event.results.length; i++) {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
       const text = (event.results[i][0].transcript || '').trim();
       if (!text) continue;
-      if (event.results[i].isFinal) finals.push(text);
+      if (event.results[i].isFinal) voiceFinals.push(text);
       else interim += (interim ? ' ' : '') + text;
     }
-    voiceTranscript = mergeVoiceSegments(finals);
-    const live = (voiceTranscript + ' ' + interim).trim();
+    const live = (mergeVoiceSegments(voiceFinals) + ' ' + interim).trim();
     $('voiceStatus').textContent = live ? 'Слушаю… «' + live + '»' : 'Слушаю…';
   };
 
   recognition.onerror = (event) => {
+    // no-speech — просто тишина: onend перезапустит сессию, не пугаем пользователя
+    if (event.error === 'no-speech') return;
     voiceGotResult = true; // onend после ошибки не должен писать «не расслышал»
     const messages = {
       'not-allowed': 'Доступ к микрофону запрещён. Разрешите его в настройках браузера и попробуйте снова.',
       'service-not-allowed': 'Распознавание речи недоступно. Если приложение открыто с домашнего экрана, откройте его в Safari.',
-      'no-speech': 'Речь не распознана. Говорите ближе к микрофону.',
       'audio-capture': 'Микрофон не найден на этом устройстве.',
       'network': 'Для распознавания речи нужен интернет.',
     };
@@ -450,19 +457,17 @@ function startListening() {
   };
 
   recognition.onend = () => {
-    // Слушание закончилось: по «Стоп» или самим движком — разбираем накопленное
-    const heard = voiceTranscript.trim();
-    if (heard) {
-      closeVoiceModal();
-      openVoiceReview(parseVoiceVitals(heard), heard);
+    // Движок закрыл сессию (пауза/тишина) — тихо перезапускаем, запись идёт
+    if (voiceActive && !voiceStoppedByUser) {
+      restartTimer = setTimeout(() => {
+        if (voiceActive && !voiceStoppedByUser) {
+          try { recognition.start(); } catch { /* уже запущен */ }
+        }
+      }, 250);
       return;
     }
-    if (voiceStoppedByUser) {
-      showVoiceError('Не удалось распознать показания. Нажмите «Слушать ещё раз» и повторите.');
-    } else if (voiceActive && !voiceGotResult) {
-      voiceActive = false;
-      showVoiceError('Не расслышал ни одного слова. Нажмите «Слушать ещё раз» и произнесите показания.');
-    }
+    if (voiceStoppedByUser) onListeningFinished();
+    /* Иначе — модалку закрыли или уже показана ошибка: делать нечего */
   };
 
   try {
@@ -472,14 +477,32 @@ function startListening() {
   }
 }
 
-/* Останов записи кнопкой: stop() финализирует текущий сегмент и вызовет onend */
+/* Останов записи кнопкой: текущая сессия финализируется и вызовет onend.
+ * Если «Стоп» нажат в паузе между сессиями (stop() бросит ошибку),
+ * завершаем разбор сами */
 function stopListening() {
   if (!recognition || !voiceActive) return;
   voiceActive = false;
   voiceStoppedByUser = true;
+  clearTimeout(restartTimer);
   $('voiceStopBtn').hidden = true;
   $('voiceStatus').textContent = 'Обрабатываю…';
-  recognition.stop();
+  try {
+    recognition.stop();
+  } catch {
+    onListeningFinished();
+  }
+}
+
+/* Разбор накопленного после останова по кнопке */
+function onListeningFinished() {
+  const heard = mergeVoiceSegments(voiceFinals).trim();
+  if (heard) {
+    closeVoiceModal();
+    openVoiceReview(parseVoiceVitals(heard), heard);
+    return;
+  }
+  showVoiceError('Не удалось распознать показания. Нажмите «Слушать ещё раз» и повторите.');
 }
 
 function showVoiceError(message) {
@@ -498,6 +521,7 @@ function closeVoiceModal() {
 }
 
 function closeVoiceInput() {
+  clearTimeout(restartTimer);
   if (recognition) recognition.abort();
   closeVoiceModal();
 }

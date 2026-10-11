@@ -13,7 +13,7 @@
 
 // Версия кэша: менять при каждом изменении файлов оболочки (app.js и др.),
 // чтобы install заново прогрел кэш со свежими файлами
-const CACHE_NAME = 'medjournal-cache-v13';
+const CACHE_NAME = 'medjournal-cache-v14';
 
 /* Ядро приложения — кэшируем на этапе install строго */
 const APP_SHELL = [
