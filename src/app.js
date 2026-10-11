@@ -371,6 +371,29 @@ function parseVoiceVitals(raw) {
   return result;
 }
 
+/*
+ * Склейка финальных сегментов continuous-распознавания. Android Chrome
+ * в этом режиме часто переотдаёт сказанное: несколькими «дорастающими»
+ * кусками («122» → «122x83» → «122x83-75») и/или точными повторами
+ * последнего сегмента. Оставляем самую полную версию каждого куска.
+ */
+function mergeVoiceSegments(rawSegments) {
+  const segments = [];
+  for (const raw of rawSegments) {
+    const text = (raw || '').trim();
+    if (!text) continue;
+    const prev = segments[segments.length - 1];
+    if (prev === text) continue; // точный повтор предыдущего сегмента
+    if (prev && text.startsWith(prev)) {
+      segments[segments.length - 1] = text; // уточнение: «122» → «122x83»
+      continue;
+    }
+    if (prev && prev.startsWith(text)) continue; // откат к более короткому
+    segments.push(text);
+  }
+  return segments.join(' ');
+}
+
 function openVoiceInput() {
   setModal($('voiceModal'), true);
   if (!SpeechRec) {
@@ -400,17 +423,17 @@ function startListening() {
 
   recognition.onresult = (event) => {
     voiceGotResult = true;
-    // event.results накопительный: пересобираем финальный текст и черновик
+    // event.results накопительный: собираем финальные сегменты и черновик
     let interim = '';
-    let finalText = '';
+    const finals = [];
     for (let i = 0; i < event.results.length; i++) {
       const text = (event.results[i][0].transcript || '').trim();
       if (!text) continue;
-      if (event.results[i].isFinal) finalText += (finalText ? ' ' : '') + text;
+      if (event.results[i].isFinal) finals.push(text);
       else interim += (interim ? ' ' : '') + text;
     }
-    voiceTranscript = finalText;
-    const live = (finalText + ' ' + interim).trim();
+    voiceTranscript = mergeVoiceSegments(finals);
+    const live = (voiceTranscript + ' ' + interim).trim();
     $('voiceStatus').textContent = live ? 'Слушаю… «' + live + '»' : 'Слушаю…';
   };
 
