@@ -13,7 +13,7 @@
 
 // Версия кэша: менять при каждом изменении файлов оболочки (app.js и др.),
 // чтобы install заново прогрел кэш со свежими файлами
-const CACHE_NAME = 'medjournal-cache-v11';
+const CACHE_NAME = 'medjournal-cache-v12';
 
 /* Ядро приложения — кэшируем на этапе install строго */
 const APP_SHELL = [
@@ -71,11 +71,13 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-/* Сеть → при офлайне кэш; для навигаций последний рубеж — index.html */
+/* Сеть → при офлайне кэш; для навигаций последний рубеж — index.html.
+ * cache: 'no-cache' — браузер всегда перепроверяет HTTP-кэш у сервера,
+ * иначе после деплоя можно получить устаревший файл из кэша браузера */
 async function networkFirst(request, isNavigation) {
   const cache = await caches.open(CACHE_NAME);
   try {
-    const response = await fetch(request);
+    const response = await fetch(request, { cache: 'no-cache' });
     if (response && response.ok) cache.put(request, response.clone());
     return response;
   } catch (err) {
