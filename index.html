@@ -141,7 +141,7 @@
         <i data-lucide="mic" class="mic-icon"></i>
       </div>
 
-      <p id="voiceStatus" class="voice-status">Слушаю… Произнесите показания (например: 120 на 80, пульс 70)</p>
+      <p id="voiceStatus" class="voice-status">Слушаю… Произнесите показания и нажмите «Стоп» (например: 120 на 80, пульс 70)</p>
 
       <div id="voiceError" class="voice-error" hidden>
         <i data-lucide="mic-off" class="h-9 w-9"></i>
@@ -150,6 +150,7 @@
     </div>
 
     <div class="voice-controls">
+      <button type="button" id="voiceStopBtn" class="btn-pill" hidden>Стоп</button>
       <button type="button" id="voiceRetryBtn" class="btn-pill" hidden>Слушать ещё раз</button>
       <button type="button" id="voiceCloseBtn" class="btn-pill">Закрыть</button>
     </div>

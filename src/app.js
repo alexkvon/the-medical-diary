@@ -46,6 +46,8 @@ let toastTimer = null;
 let recognition = null;   // текущий инстанс SpeechRecognition
 let voiceActive = false;  // слушаем прямо сейчас
 let voiceGotResult = false; // пришли ли хоть какие-то данные
+let voiceTranscript = ''; // накопленный финальный текст всех сегментов
+let voiceStoppedByUser = false; // слушание остановлено кнопкой «Стоп»
 
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -381,34 +383,35 @@ function openVoiceInput() {
 function startListening() {
   $('voiceError').hidden = true;
   $('voiceRetryBtn').hidden = true;
+  $('voiceStopBtn').hidden = false;
   $('micWrap').classList.remove('is-idle');
-  $('voiceStatus').textContent = 'Слушаю… Произнесите показания (например: 120 на 80, пульс 70)';
+  $('voiceStatus').textContent = 'Слушаю… Произнесите показания и нажмите «Стоп»';
 
   // Инстансы SpeechRecognition одноразовые — создаём на каждое прослушивание
   recognition = new SpeechRec();
   recognition.lang = 'ru-RU';
-  recognition.interimResults = false;
+  recognition.continuous = true;     // пауза не обрывает запись — ждём «Стоп»
+  recognition.interimResults = true; // показываем текст по мере речи
   recognition.maxAlternatives = 3;
   voiceActive = true;
   voiceGotResult = false;
+  voiceTranscript = '';
+  voiceStoppedByUser = false;
 
   recognition.onresult = (event) => {
     voiceGotResult = true;
-    voiceActive = false;
-
-    // Перебираем альтернативы распознавания: берём первую, где нашлись SYS и DIA
-    let best = null, bestHeard = '';
-    const alternatives = event.results[0] || [];
-    for (let i = 0; i < alternatives.length; i++) {
-      const heard = alternatives[i].transcript || '';
-      const parsed = parseVoiceVitals(heard);
-      const better = !best || ((parsed.sys && parsed.dia) && !(best.sys && best.dia));
-      if (better) { best = parsed; bestHeard = heard; }
-      if (best.sys && best.dia) break;
+    // event.results накопительный: пересобираем финальный текст и черновик
+    let interim = '';
+    let finalText = '';
+    for (let i = 0; i < event.results.length; i++) {
+      const text = (event.results[i][0].transcript || '').trim();
+      if (!text) continue;
+      if (event.results[i].isFinal) finalText += (finalText ? ' ' : '') + text;
+      else interim += (interim ? ' ' : '') + text;
     }
-
-    closeVoiceModal();
-    openVoiceReview(best, bestHeard);
+    voiceTranscript = finalText;
+    const live = (finalText + ' ' + interim).trim();
+    $('voiceStatus').textContent = live ? 'Слушаю… «' + live + '»' : 'Слушаю…';
   };
 
   recognition.onerror = (event) => {
@@ -424,7 +427,16 @@ function startListening() {
   };
 
   recognition.onend = () => {
-    if (voiceActive && !voiceGotResult) {
+    // Слушание закончилось: по «Стоп» или самим движком — разбираем накопленное
+    const heard = voiceTranscript.trim();
+    if (heard) {
+      closeVoiceModal();
+      openVoiceReview(parseVoiceVitals(heard), heard);
+      return;
+    }
+    if (voiceStoppedByUser) {
+      showVoiceError('Не удалось распознать показания. Нажмите «Слушать ещё раз» и повторите.');
+    } else if (voiceActive && !voiceGotResult) {
       voiceActive = false;
       showVoiceError('Не расслышал ни одного слова. Нажмите «Слушать ещё раз» и произнесите показания.');
     }
@@ -437,9 +449,20 @@ function startListening() {
   }
 }
 
+/* Останов записи кнопкой: stop() финализирует текущий сегмент и вызовет onend */
+function stopListening() {
+  if (!recognition || !voiceActive) return;
+  voiceActive = false;
+  voiceStoppedByUser = true;
+  $('voiceStopBtn').hidden = true;
+  $('voiceStatus').textContent = 'Обрабатываю…';
+  recognition.stop();
+}
+
 function showVoiceError(message) {
   voiceActive = false;
   $('micWrap').classList.add('is-idle');
+  $('voiceStopBtn').hidden = true;
   $('voiceStatus').textContent = 'Голосовой ввод';
   $('voiceErrorText').textContent = message;
   $('voiceError').hidden = false;
@@ -541,6 +564,7 @@ function bindEvents() {
   // Голосовой ввод
   $('voiceBtn').addEventListener('click', openVoiceInput);
   $('voiceCloseBtn').addEventListener('click', closeVoiceInput);
+  $('voiceStopBtn').addEventListener('click', stopListening);
   $('voiceRetryBtn').addEventListener('click', startListening);
 
   // Проверка распознанного
