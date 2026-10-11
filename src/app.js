@@ -281,28 +281,12 @@ const RU_NUM_WORDS = {
 };
 
 /*
- * Замена всех видов дефисов, тире и минусов на пробел. Юникодных вариантов
- * много (обычный дефис, неразрывный, минус, типографские тире), и выглядят
- * они одинаково — распознаватель речи может вернуть любой из них.
- */
-function normalizeDashes(s) {
-  let out = '';
-  for (const ch of s) {
-    const c = ch.codePointAt(0);
-    const isDash = c === 45 || (c >= 8208 && c <= 8213) || c === 8259 ||
-      c === 8722 || c === 65078 || c === 65099 || c === 65293;
-    out += isDash ? ' ' : ch;
-  }
-  return out;
-}
-
-/*
  * Разбор произнесённой фразы: «Сто двадцать на восемьдесят, пульс семьдесят,
  * подъём по лестнице» -> { sys: '120', dia: '80', pul: '70', comment: '...' }.
- * Слова-числительные складываются в группы (сотни+десятки+единицы),
- * разделители групп — слова-не-числительные и цифры. Назначение: сначала
- * по ключевым словам (пульс / верхнее / нижнее), затем по порядку чтения
- * с проверкой диапазонов LIMITS. Текст после последнего числа — комментарий.
+ * Из фразы берутся первые 1–3 числовых значения (цифры или слова-числительные,
+ * складываемые в группы сотни+десятки+единицы). Порядок всегда фиксированный:
+ * первое число — SYS, второе — DIA, третье — пульс; каждое проверяется
+ * на диапазон LIMITS. Текст после последнего числа — комментарий.
  */
 function parseVoiceVitals(raw) {
   const result = { sys: '', dia: '', pul: '', comment: '' };
@@ -310,105 +294,71 @@ function parseVoiceVitals(raw) {
   const rawTokens = String(raw).trim().split(/\s+/).filter(Boolean);
   if (!rawTokens.length) return result;
 
-  // Нормализация отдельного токена: регистр, ё; любые дефисы/тире и прочие
-  // разделители превращаются в пробелы — «122-83-75» распадётся на три числа
-  const norm = (t) => {
-    const withSpaces = normalizeDashes(t.toLowerCase().replace(/ё/g, 'е'))
-      .replace(/[/\\,.:;!?+()]/g, ' ');
-    return withSpaces.replace(/\s+/g, ' ').trim();
-  };
+  // Нормализация токена для сравнения со словарём числительных: регистр, ё
+  // и обрезка знаков по краям («восемьдесят,» → «восемьдесят»). Сам токен
+  // не разрезается: «122-83-75» остаётся одним токеном и числом не станет
+  const norm = (t) => t.toLowerCase().replace(/ё/g, 'е')
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 
   const inRange = (v, range) => v >= range[0] && v <= range[1];
 
-  // Собираем группы чисел; перед группой — последнее ключевое слово
+  // Собираем группы чисел: цифры становятся группой целиком, слова-числительные
+  // складываются в сотни/десятки/единицы текущей группы
   const groups = [];
-  let keyword = '';
   let composed = null;   // { h, t, u } — сотни/десятки/единицы текущей группы
   let lastNumToken = -1; // индекс последнего токена, вошедшего в число
 
   const flush = () => {
     if (composed) {
       const v = composed.h + composed.t + composed.u;
-      if (v > 0) groups.push({ value: v, keyword, endToken: lastNumToken });
+      if (v > 0) groups.push({ value: v, endToken: lastNumToken });
       composed = null;
     }
   };
 
   for (let i = 0; i < rawTokens.length; i++) {
-    // Один сырой токен может распасться на несколько («122-83-75» -> 122, 83, 75)
-    const pieces = norm(rawTokens[i]).split(' ').filter(Boolean);
-    for (const token of pieces) {
-      if (/^\d{1,3}$/.test(token)) {
-        flush();
-        groups.push({ value: Number(token), keyword, endToken: i });
-        lastNumToken = i;
-        keyword = ''; // ключевое слово «израсходовано» этой группой
-        continue;
-      }
-      const word = RU_NUM_WORDS[token];
-      if (word !== undefined) {
-        lastNumToken = i;
-        if (!composed) composed = { h: 0, t: 0, u: 0 };
-        if (word >= 100 && !composed.h) composed.h = word;
-        else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
-        else if (word < 20 && !composed.u) composed.u = word;
-        else { flush(); composed = { h: word >= 100 ? word : 0, t: word >= 20 && word < 100 ? word : 0, u: word < 20 ? word : 0 }; }
-        continue;
-      }
-      // Слово-не-числительное завершает текущую группу
+    const token = norm(rawTokens[i]);
+    if (/^\d{1,3}$/.test(token)) {
       flush();
-      if (/^(пульс|пульса|пульсом|удар|удара|ударов|сердц)/.test(token)) keyword = 'pul';
-      else if (/^(верхн|систол)/.test(token)) keyword = 'sys';
-      else if (/^(нижн|диастол)/.test(token)) keyword = 'dia';
-      else keyword = ''; // прочие слова сбрасывают ключевое слово
+      groups.push({ value: Number(token), endToken: i });
+      lastNumToken = i;
+      continue;
     }
+    const word = RU_NUM_WORDS[token];
+    if (word !== undefined) {
+      lastNumToken = i;
+      if (!composed) composed = { h: 0, t: 0, u: 0 };
+      if (word >= 100 && !composed.h) composed.h = word;
+      else if (word >= 20 && word < 100 && !composed.t) composed.t = word;
+      else if (word < 20 && !composed.u) composed.u = word;
+      else { flush(); composed = { h: word >= 100 ? word : 0, t: word >= 20 && word < 100 ? word : 0, u: word < 20 ? word : 0 }; }
+      continue;
+    }
+    // Слово-не-числительное завершает текущую группу
+    flush();
   }
   flush();
 
-  // 1) Группы с ключевыми словами
-  const used = new Array(groups.length).fill(false);
-  for (let i = 0; i < groups.length; i++) {
-    const g = groups[i];
-    if (!g.keyword || used[i]) continue;
-    if (g.keyword === 'sys' && !result.sys && inRange(g.value, LIMITS.sys)) {
-      result.sys = String(g.value); used[i] = true;
-    } else if (g.keyword === 'dia' && !result.dia && inRange(g.value, LIMITS.dia)) {
-      result.dia = String(g.value); used[i] = true;
-    } else if (g.keyword === 'pul' && !result.pul && inRange(g.value, LIMITS.pul)) {
-      result.pul = String(g.value); used[i] = true;
-    }
-  }
-
-  // 2) Фолбэк по порядку чтения: SYS, затем DIA < SYS, затем пульс
-  for (let i = 0; i < groups.length; i++) {
-    const g = groups[i];
-    if (used[i]) continue;
-    if (!result.sys && inRange(g.value, LIMITS.sys)) {
-      result.sys = String(g.value); used[i] = true;
-      continue;
-    }
-    if (result.sys && !result.dia && inRange(g.value, LIMITS.dia) && g.value < Number(result.sys)) {
-      result.dia = String(g.value); used[i] = true;
-      continue;
-    }
-    if (result.sys && result.dia && !result.pul && inRange(g.value, LIMITS.pul)) {
-      result.pul = String(g.value); used[i] = true;
+  // Первые 1–3 числа назначаются позиционно и всегда в одном порядке:
+  // SYS, DIA, пульс. Значение вне диапазона LIMITS не заполняется —
+  // его можно исправить на экране проверки.
+  const roles = ['sys', 'dia', 'pul'];
+  for (let i = 0; i < Math.min(groups.length, roles.length); i++) {
+    if (inRange(groups[i].value, LIMITS[roles[i]])) {
+      result[roles[i]] = String(groups[i].value);
     }
   }
 
   // Комментарий: всё, что произнесено после последнего распознанного числа
-  let lastEnd = -1;
-  for (let i = 0; i < groups.length; i++) {
-    if (used[i]) lastEnd = Math.max(lastEnd, groups[i].endToken);
+  if (groups.length) {
+    const lastEnd = groups[Math.min(groups.length, 3) - 1].endToken;
+    let comment = rawTokens.slice(lastEnd + 1).join(' ').trim();
+    if (comment) comment = comment.charAt(0).toUpperCase() + comment.slice(1);
+    if (comment.length > 300) comment = comment.slice(0, 300);
+    // Без распознанных показаний хвост фразы — не комментарий, а мусор
+    if (!result.sys && !result.dia) comment = '';
+    result.comment = comment;
   }
-  const tail = rawTokens.slice(lastEnd + 1)
-    .filter((t) => !/^(пульс|пульса|пульсом|давление|удар|удара|ударов)$/i.test(norm(t)));
-  let comment = tail.join(' ').trim();
-  if (comment) comment = comment.charAt(0).toUpperCase() + comment.slice(1);
-  if (comment.length > 300) comment = comment.slice(0, 300);
-  // Без распознанных показаний хвост фразы — не комментарий, а мусор
-  if (!result.sys && !result.dia) comment = '';
-  result.comment = comment;
 
   return result;
 }
