@@ -328,42 +328,6 @@ textarea.field {
   white-space: nowrap;
 }
 
-/* ---------- Категории давления (точка + бейдж) ---------- */
-
-.cat-optimal  { --cat: #10b981; --cat-bg: #d1fae5; }
-.cat-normal   { --cat: #0d9488; --cat-bg: #ccfbf1; }
-.cat-elevated { --cat: #d97706; --cat-bg: #fef3c7; }
-.cat-high     { --cat: #ea580c; --cat-bg: #ffedd5; }
-.cat-crisis   { --cat: #e11d48; --cat-bg: #ffe4e6; }
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  flex: none;
-  padding: 0.3125rem 0.75rem;
-  border-radius: 999px;
-  font-size: 0.75rem;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-}
-
-.badge[class*='cat-'] {
-  color: var(--cat);
-  background: var(--cat-bg);
-}
-
-.cat-dot {
-  flex: none;
-  width: 0.625rem;
-  height: 0.625rem;
-  border-radius: 999px;
-}
-
-.cat-dot[class*='cat-'] {
-  background: var(--cat);
-}
-
 /* ---------- Пустое состояние ---------- */
 
 .empty-note {

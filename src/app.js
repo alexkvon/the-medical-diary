@@ -148,19 +148,7 @@ function sortedRecords(direction = 'desc') {
 }
 
 /* ------------------------------------------------------------
- * 5. Категория давления
- * ------------------------------------------------------------ */
-
-function classifyBP(sys, dia) {
-  if (sys >= 160 || dia >= 100) return { label: 'Кризисное', cls: 'cat-crisis' };
-  if (sys >= 140 || dia >= 90) return { label: 'Высокое', cls: 'cat-high' };
-  if (sys >= 130 || dia >= 85) return { label: 'Повышенное', cls: 'cat-elevated' };
-  if (sys >= 120 && dia < 80) return { label: 'Норма', cls: 'cat-normal' };
-  return { label: 'Оптимальное', cls: 'cat-optimal' };
-}
-
-/* ------------------------------------------------------------
- * 6. Рендер интерфейса
+ * 5. Рендер интерфейса
  * ------------------------------------------------------------ */
 
 function renderAll() {
@@ -180,7 +168,6 @@ function renderSummary() {
     return;
   }
 
-  const cat = classifyBP(last.sys, last.dia);
   box.innerHTML = `
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
@@ -190,7 +177,6 @@ function renderSummary() {
           <span class="summary-unit">мм рт. ст.</span>
         </p>
       </div>
-      <span class="badge ${cat.cls}">${cat.label}</span>
     </div>
     <div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-500">
       ${last.pul != null ? `<span class="inline-flex items-center gap-1.5"><i data-lucide="activity" class="h-4 w-4 text-rose-500"></i><span class="font-semibold text-slate-700">${last.pul}</span>&nbsp;уд/мин</span>` : ''}
@@ -205,16 +191,14 @@ function renderHistory() {
   $('recordsCount').textContent = String(records.length);
 
   $('historyList').innerHTML = records.map((r) => {
-    const cat = classifyBP(r.sys, r.dia);
     return `
       <li class="card record">
-        <span class="cat-dot ${cat.cls}" aria-hidden="true"></span>
         <div class="min-w-0 flex-1">
           <p class="record-main">
             <span class="font-bold">${r.sys}/${r.dia}</span><span class="text-xs text-slate-400">мм рт. ст.</span>
             ${r.pul != null ? `<span class="record-pulse"><i data-lucide="activity" class="h-3.5 w-3.5"></i>${r.pul}</span>` : ''}
           </p>
-          <p class="text-xs text-slate-400">${formatDate(r.date)} · ${cat.label}</p>
+          <p class="text-xs text-slate-400">${formatDate(r.date)}</p>
           ${r.comment ? `<p class="record-comment" title="${escapeHtml(r.comment)}">${escapeHtml(r.comment)}</p>` : ''}
         </div>
         <button type="button" class="btn-icon-danger" data-delete-id="${r.id}" aria-label="Удалить запись">
